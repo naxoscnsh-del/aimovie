@@ -150,3 +150,14 @@ def test_demo_mode_config(tmp_path):
     finally:
         srv.should_exit = True
         th.join(timeout=5)
+
+
+def test_healthz_without_login(tmp_path):
+    srv, th, base, app = start(tmp_path)
+    try:
+        r = requests.get(f"{base}/healthz")
+        assert r.status_code == 200 and r.json()["ok"]
+        assert requests.get(f"{base}/api/config").status_code == 401  # 其他接口仍需登录
+    finally:
+        srv.should_exit = True
+        th.join(timeout=5)

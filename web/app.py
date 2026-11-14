@@ -93,6 +93,8 @@ class Auth(BaseHTTPMiddleware):
         return resp
 
     async def _dispatch(self, request: Request, call_next):
+        if request.url.path == "/healthz":  # 健康检查不需要登录
+            return await call_next(request)
         has_users = await run_in_threadpool(self.team.has_users)
         if not has_users and not self.password:
             request.state.user, request.state.role = "", "admin"
@@ -229,6 +231,9 @@ def create_app(settings: Settings | None = None, data_dir: Path | None = None,
         return dest
 
     # ---------- 路由 ----------
+    async def healthz(_req):
+        return JSONResponse({"ok": True, "demo": s.demo_mode, "workers": runner.workers})
+
     async def index(_req):
         return FileResponse(STATIC / "index.html", headers={"Cache-Control": "no-cache"})
 
@@ -767,6 +772,7 @@ def create_app(settings: Settings | None = None, data_dir: Path | None = None,
 
     routes = [
         Route("/", index),
+        Route("/healthz", healthz),
         Route("/api/config", config),
         Route("/api/projects", list_projects, methods=["GET"]),
         Route("/api/projects", create_project, methods=["POST"]),

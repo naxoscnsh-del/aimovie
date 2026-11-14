@@ -1,9 +1,19 @@
 services:
   app:
-    build: .
+    build:
+      context: .
+      args:
+        APT_MIRROR: ${APT_MIRROR:-}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-}
+    image: aimovie:latest
     env_file: .env
     ports:
-      - "8000:8000"
+      - "${APP_PORT:-8000}:8000"
     volumes:
       - ./data:/app/data   # 数据库、素材、成片都在这里，备份这个目录即可
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"

@@ -1,0 +1,11 @@
+# 对外网开放时用 Caddy 自动申请 HTTPS 证书（需要域名已解析到这台服务器，且 80/443 端口开放）
+# 安装：https://caddyserver.com/docs/install
+# 用法：把 video.example.com 换成你的域名，保存为 /etc/caddy/Caddyfile，然后 systemctl reload caddy
+video.example.com {
+    reverse_proxy 127.0.0.1:8000 {
+        flush_interval -1          # 实时进度推送（SSE）不缓冲
+    }
+    request_body {
+        max_size 30MB              # 参考图 / BGM 上传
+    }
+}

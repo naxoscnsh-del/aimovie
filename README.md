@@ -13,6 +13,25 @@ docker compose up -d --build      # 打开 http://localhost:8000
 演示模式下脚本、场景图、视频、配音都用本地生成的占位素材，可以把新建 → 改脚本 → 选图 → 生成视频 → 合成 → 导出的完整流程点一遍。
 正式使用前把 `DEMO_MODE` 改回 0 并重启。
 
+## 服务器部署（/data/aimovie）
+
+首次部署（服务器需已装 Docker）：
+
+```bash
+cd /data && tar xzf aimovie-<提交号>.tar.gz && cd /data/aimovie
+bash deploy.sh            # 生成 .env 和管理员密码，默认演示模式；国内网络加 --cn，换端口加 --port 8080
+```
+
+更新版本（`.env` 和 `data/` 不在包里，不会被覆盖）：
+
+```bash
+cd /data/aimovie && rm -rf videogen web tests deploy
+cd /data && tar xzf aimovie-<提交号>.tar.gz && cd /data/aimovie
+docker compose up -d --build app
+```
+
+备份：`bash backup.sh`（可加到 crontab 每天执行）。对外网开放的 HTTPS 反代示例见 `deploy/`。
+
 ## 快速开始（Docker，推荐）
 
 ```bash
