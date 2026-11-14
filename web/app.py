@@ -660,6 +660,11 @@ def create_app(settings: Settings | None = None, data_dir: Path | None = None,
         resp.delete_cookie(STATE_COOKIE, path=f"{base}/")
         return resp
 
+    async def auth_debug(req: Request):
+        if not getattr(oidc, "is_portal", False):
+            return err("仅门户 SSO 模式可用", 404)
+        return JSONResponse(await run_in_threadpool(oidc.diagnose, req.cookies))
+
     async def auth_logout(req: Request):
         url = await run_in_threadpool(oidc.logout_url)
         resp = RedirectResponse(url, status_code=302)
@@ -926,6 +931,7 @@ def create_app(settings: Settings | None = None, data_dir: Path | None = None,
         Route("/auth/login", auth_login),
         Route("/auth/callback", auth_callback),
         Route("/auth/logout", auth_logout),
+        Route("/auth/debug", auth_debug),
         Route("/api/sso-users", sso_users),
         Route("/api/sso-users/{sub}", sso_user_role, methods=["PATCH"]),
         Route("/api/users", list_users, methods=["GET"]),

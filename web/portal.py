@@ -14,7 +14,11 @@ import os
 import time
 from dataclasses import dataclass, field
 
+import logging
+
 import requests
+
+log = logging.getLogger("aimovie.portal")
 
 PORTAL_COOKIE = "ni_portal"
 
@@ -64,9 +68,29 @@ class PortalAuth:
     def login_url(self) -> str:
         return f"{self.cfg.portal_url}/login"
 
+    def diagnose(self, cookies) -> dict:
+        """只返回状态，不返回 Cookie 内容：给 /auth/debug 排障用。"""
+        token = cookies.get(PORTAL_COOKIE)
+        out = {"has_cookie": bool(token), "cookie_names": sorted(cookies.keys()), "uid_in_cookie": bool(token and _uid_of(token)),
+               "hrbp": self.cfg.hrbp_base_url}
+        if token:
+            try:
+                r = self.http.get(f"{self.cfg.hrbp_base_url}/api/portal/session",
+                                  headers={"Cookie": f"{PORTAL_COOKIE}={token}"}, timeout=8)
+                out["hrbp_status"] = r.status_code
+                try:
+                    d = r.json()
+                    out["hrbp_ok"], out["hrbp_pending"], out["name"] = d.get("ok"), d.get("pending"), d.get("name")
+                except ValueError:
+                    out["hrbp_body"] = r.text[:120]
+            except requests.RequestException as e:
+                out["hrbp_error"] = str(e)[:200]
+        return out
+
     def identify(self, cookies) -> dict | None:
         token = cookies.get(PORTAL_COOKIE)
         if not token:
+            log.warning("未登录：请求里没有 %s Cookie（已有：%s）", PORTAL_COOKIE, sorted(cookies.keys()))
             return None
         hit = self._cache.get(token)
         if hit and hit[0] > time.time():
@@ -80,11 +104,13 @@ class PortalAuth:
         except requests.RequestException as e:
             raise PortalError(f"无法连接 HRBP：{e}") from None
         if r.status_code == 401:
+            log.warning("HRBP 会话接口返回 401（Cookie 无效或已过期）")
             return None
         if r.status_code != 200:
             raise PortalError(f"HRBP 返回 HTTP {r.status_code}")
         data = r.json()
-        if not data.get("ok") or data.get("pending"):  # pending：账号申请还没通过
+        if not data.get("ok") or data.get("pending"):
+            log.warning("HRBP 会话不可用：ok=%s pending=%s", data.get("ok"), data.get("pending"))  # pending：账号申请还没通过
             return None
         user = {"sub": uid, "name": str(data.get("name") or uid)[:40], "email": ""}
         if len(self._cache) > 500:

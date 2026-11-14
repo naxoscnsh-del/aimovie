@@ -72,3 +72,11 @@ def test_portal_upstream_down(tmp_path):
     c.cookies.set("ni_portal", cookie("u2"))
     assert c.get("/movie/api/projects").status_code == 503
     assert c.get("/movie/healthz").status_code == 200
+
+
+def test_portal_debug(tmp_path):
+    c, hr = make(tmp_path)
+    assert c.get("/movie/auth/debug").json()["has_cookie"] is False
+    c.cookies.set("ni_portal", cookie("u1"))
+    d = c.get("/movie/auth/debug").json()
+    assert d["has_cookie"] and d["hrbp_status"] == 200 and d["name"] == "小林" and "sig" not in str(d)
