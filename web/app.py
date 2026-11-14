@@ -36,6 +36,7 @@ from videogen.pipeline import Pipeline, Project, StageError
 from videogen.script import ScriptError
 
 from .jobs import JobStore, ProjectBusy, Runner, default_factory
+from .portal import PortalAuth, PortalConfig, PortalError
 from .oidc import OIDC, SESSION_COOKIE, STATE_COOKIE, OIDCConfig, OIDCError
 from .team import ASSET_KINDS, TeamError, TeamStore
 
@@ -138,7 +139,13 @@ class Auth(BaseHTTPMiddleware):
         path = request.url.path[len(self.base):] if request.url.path.startswith(self.base) else request.url.path
         if path.startswith("/auth/") or path.startswith("/static/"):
             return await call_next(request)
-        sess = self.oidc.read_session(request.cookies.get(SESSION_COOKIE))
+        try:
+            if getattr(self.oidc, "is_portal", False):
+                sess = await run_in_threadpool(self.oidc.identify, request.cookies)
+            else:
+                sess = self.oidc.read_session(request.cookies.get(SESSION_COOKIE))
+        except PortalError as e:
+            return Response(f"登录服务暂不可用：{e}", status_code=503, media_type="text/plain; charset=utf-8")
         if not sess:
             login = f"{self.base}/auth/login"
             if path.startswith(("/api/", "/files/", "/library/")):
@@ -155,7 +162,7 @@ def create_app(settings: Settings | None = None, data_dir: Path | None = None,
                factory=default_factory, workers: int | None = None,
                password: str | None = None, team_budget_usd: float | None = None,
                base_path: str | None = None, oidc_config: OIDCConfig | None = None,
-               oidc_session=None) -> Starlette:
+               oidc_session=None, portal_config: PortalConfig | None = None) -> Starlette:
     s = settings or Settings.from_env()
     data = Path(data_dir or os.environ.get("DATA_DIR", "data"))
     runs = data / "runs"
@@ -168,6 +175,9 @@ def create_app(settings: Settings | None = None, data_dir: Path | None = None,
     base = normalize_base(base_path if base_path is not None else os.environ.get("BASE_PATH", ""))
     oidc_cfg = oidc_config if oidc_config is not None else OIDCConfig.from_env()
     oidc = OIDC(oidc_cfg, base, session=oidc_session) if oidc_cfg else None
+    if oidc is None:
+        portal_cfg = portal_config if portal_config is not None else PortalConfig.from_env()
+        oidc = PortalAuth(portal_cfg, base, session=oidc_session) if portal_cfg else None
     team_budget = float(os.environ.get("TEAM_MONTHLY_BUDGET_USD", 0) or 0) if team_budget_usd is None else team_budget_usd
 
     # ---------- 工具 ----------
@@ -292,7 +302,7 @@ def create_app(settings: Settings | None = None, data_dir: Path | None = None,
         return JSONResponse({
             "user": user_of(req), "role": getattr(req.state, "role", ""),
             "auth": "oidc" if oidc else ("accounts" if team.has_users() else ("password" if password else "open")),
-            "logout": f"{base}/auth/logout" if oidc else None,
+            "logout": f"{base}/auth/logout" if oidc and not getattr(oidc, "is_portal", False) else None,
             "accounts": bool(oidc) or team.has_users(),
             "asset_kinds": ASSET_KINDS, "team_budget_usd": team_budget, "budget_usd": s.budget_usd, "budget_warn_usd": s.budget_warn_usd,
             "ratios": list(RATIO_SIZES), "durations": s.seedance_durations,
@@ -614,6 +624,13 @@ def create_app(settings: Settings | None = None, data_dir: Path | None = None,
         nxt = req.query_params.get("next") or "/"
         if not nxt.startswith("/") or nxt.startswith("//"):
             nxt = "/"
+        if getattr(oidc, "is_portal", False):
+            try:
+                if await run_in_threadpool(oidc.identify, req.cookies):
+                    return RedirectResponse(f"{base}{nxt}", status_code=302)
+            except PortalError as e:
+                return Response(f"登录服务暂不可用：{e}", status_code=503, media_type="text/plain; charset=utf-8")
+            return RedirectResponse(oidc.login_url, status_code=302)  # 门户登录后，从门户首页进入本系统
         try:
             state, nonce, verifier, cookie = oidc.new_state(nxt)
             url = await run_in_threadpool(oidc.authorize_url, state, nonce, verifier)

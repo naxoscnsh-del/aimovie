@@ -185,3 +185,10 @@ SQLite 任务队列 + 后台线程（web/jobs.py）── 每个项目同一时�
 `.env` 设 `AUTH_MODE=oidc` 及 `OIDC_ISSUER / OIDC_CLIENT_ID / OIDC_CLIENT_SECRET / PUBLIC_URL / SESSION_SECRET`（见 `.env.example`），
 身份中心里为 `aimovie` 登记回调 `https://www.ainewimage.com/movie/auth/callback`。登录后用 id_token 的 `sub` 作账号标识；
 `OIDC_ADMINS` 里的人固定为管理员，其他人默认成员，管理员可在「成员」页调整。nginx 切换脚本加 `--no-gate` 去掉门户登录拦截，避免二次登录。
+
+## 门户 SSO（推荐）
+
+`.env` 设 `AUTH_MODE=portal`（可选 `HRBP_BASE_URL`、`PORTAL_URL`、`PORTAL_ADMINS`，见 `.env.example`）。
+浏览器带着门户登录写下的 `ni_portal` Cookie 访问 `/movie/`，应用把它转发给 `HRBP_BASE_URL/api/portal/session` 验证并取姓名，
+账号 ID 即 HRBP User.id。未登录跳转门户登录页，登录后从门户进入；成员页可调整角色，`PORTAL_ADMINS` 里的人固定为管理员。
+此模式下 nginx 切换脚本**不要**加 `--no-gate`（保留门户 auth_request 即可）。
