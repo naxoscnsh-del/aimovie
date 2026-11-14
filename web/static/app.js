@@ -1,26 +1,11 @@
 "use strict";
-// AI 短片工作台 — 无构建步骤的单页应用
+// AI 短片工作台 — Vue 3（浏览器版，无构建步骤）：左侧菜单 + 右侧页面
+const { createApp, reactive, ref, computed, watch, onMounted, onBeforeUnmount, nextTick } = Vue;
 
-// ---------- 工具 ----------
-// 部署在子路径（如 /movie/）时，所有接口地址都要带上这个前缀
-const BASE = location.pathname.replace(/\/[^/]*$/, "");
-const $ = (s, r = document) => r.querySelector(s);
-function h(tag, props, ...kids) {
-  const el = document.createElement(tag);
-  for (const [k, v] of Object.entries(props || {})) {
-    if (v == null || v === false) continue;
-    if (k === "class") el.className = v;
-    else if (k === "style") el.style.cssText = v;
-    else if (k.startsWith("on")) el.addEventListener(k.slice(2), v);
-    else if (k === "value" || k === "checked" || k === "disabled" || k === "selected") el[k] = v;
-    else el.setAttribute(k, v === true ? "" : v);
-  }
-  for (const kid of kids.flat(Infinity)) {
-    if (kid == null || kid === false) continue;
-    el.append(kid instanceof Node ? kid : String(kid));
-  }
-  return el;
-}
+// ---------- 基础 ----------
+const BASE = location.pathname.replace(/\/[^/]*$/, "");        // 子路径部署，如 /movie
+const store = reactive({ cfg: null, toast: null, route: { name: "list", params: {} }, menuOpen: false });
+
 async function api(path, opts = {}) {
   const init = { method: opts.method || "GET", headers: {} };
   if (opts.form) init.body = opts.form;
@@ -28,16 +13,19 @@ async function api(path, opts = {}) {
   const r = await fetch(path.startsWith("/") ? BASE + path : path, init);
   let data = null;
   try { data = await r.json(); } catch (_) { /* 非 JSON */ }
+  if (r.status === 401 && data && data.login) { location.href = data.login; throw new Error("登录已过期，正在跳转登录…"); }
   if (!r.ok) throw new Error((data && data.error) || `请求失败（${r.status}）`);
   return data;
 }
 let toastTimer;
 function toast(msg, bad = false) {
-  const t = $("#toast");
-  t.textContent = msg; t.className = "toast" + (bad ? " bad" : ""); t.hidden = false;
-  clearTimeout(toastTimer); toastTimer = setTimeout(() => (t.hidden = true), bad ? 6000 : 2500);
+  store.toast = { msg, bad };
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => (store.toast = null), bad ? 6000 : 2500);
 }
 const fail = (e) => toast(e.message || String(e), true);
+const usd = (n) => "$" + Number(n || 0).toFixed(2);
+const ratioCss = (r) => (r || "9:16").replace(":", " / ");
+const go = (hash) => { location.hash = hash; store.menuOpen = false; };
 
 const P_STATUS = {
   draft: ["待生成脚本", "todo"], scripting: ["脚本生成中", "run"], script_review: ["待确认脚本", "todo"],
@@ -49,681 +37,719 @@ const S_STATUS = {
   pending: ["未出图", ""], imaging: ["出图中", "run"], image_ready: ["待选图", "todo"],
   image_selected: ["已选图", ""], video_running: ["视频生成中", "run"], succeeded: ["视频完成", "ok"], failed: ["失败", "bad"],
 };
-const badge = (map, key) => { const [t, c] = map[key] || [key, ""]; return h("span", { class: "badge " + c }, t); };
-const usd = (n) => "$" + Number(n || 0).toFixed(2);
-const ratioCss = (r) => (r || "9:16").replace(":", " / ");
 
-// ---------- 全局状态 ----------
-const S = { cfg: null, project: null, tab: null, draft: null, dirty: false, pollTimer: null, bodySig: "" };
-
-// ---------- 路由 ----------
-window.addEventListener("hashchange", route);
-async function route() {
-  clearTimeout(S.pollTimer);
-  closeEvents();
-  if (S.dirty && !confirm("脚本有未保存的修改，确定离开？")) return;
-  S.project = null; S.tab = null; S.draft = null; S.dirty = false; S.bodySig = "";
-  const m = location.hash.match(/^#\/p\/([\w-]+)/);
-  if (m) return projectPage(m[1]);
-  if (location.hash.startsWith("#/stats")) return statsPage();
-  if (location.hash.startsWith("#/templates")) return templatesPage();
-  if (location.hash.startsWith("#/library")) return libraryPage();
-  if (location.hash.startsWith("#/members")) return membersPage();
-  return homePage();
+// ---------- 路由（hash） ----------
+function parseRoute() {
+  const h = location.hash.replace(/^#/, "") || "/";
+  let m;
+  if ((m = h.match(/^\/p\/([\w-]+)/))) return { name: "project", params: { id: m[1] } };
+  const map = { "/": "list", "/new": "new", "/templates": "templates", "/library": "library", "/stats": "stats",
+    "/members": "members", "/system": "system" };
+  return { name: map[h.split("?")[0]] || "list", params: {} };
 }
+window.addEventListener("hashchange", () => { store.route = parseRoute(); store.menuOpen = false; });
 
-// ---------- 首页 ----------
-async function homePage() {
-  const app = $("#app");
-  let templates = [], assets = [];
-  try { [templates, assets] = await Promise.all([api("/api/templates"), api("/api/assets")]); } catch (e) { fail(e); }
-  app.replaceChildren(newForm(templates, assets), h("h2", {}, "全部短片"), h("div", { id: "plist", class: "plist" }, h("div", { class: "muted" }, "加载中…")));
-  try {
-    const items = await api("/api/projects");
-    const box = $("#plist");
-    if (!items.length) return box.replaceChildren(h("div", { class: "empty" }, "还没有短片，先在上面描述一个场景"));
-    const f = S.listFilter || (S.listFilter = { who: "all", status: "", q: "" });
-    const q = h("input", { type: "text", placeholder: "搜索标题或成员", value: f.q, style: "max-width:220px" });
-    const st = h("select", { style: "max-width:150px" }, h("option", { value: "" }, "全部状态"),
-      Object.entries(P_STATUS).map(([k, [label]]) => h("option", { value: k, selected: f.status === k }, label)));
-    const whoChips = h("div", { class: "chips" });
-    const grid = h("div", { class: "plist" });
-    const draw = () => {
-      whoChips.replaceChildren(...[["all", "全部"], ["mine", "我的"]].map(([k, l]) => h("button", { class: "chip" + (f.who === k ? " on" : ""), onclick: () => { f.who = k; draw(); } }, l)));
-      const kw = f.q.trim().toLowerCase();
-      const list = items.filter((p) => (f.who === "all" || p.owner === S.cfg.user) && (!f.status || p.status === f.status)
-        && (!kw || p.title.toLowerCase().includes(kw) || (p.owner || "").toLowerCase().includes(kw)));
-      grid.replaceChildren(...(list.length ? list.map(card) : [h("div", { class: "muted" }, "没有符合条件的短片")]));
+// ---------- 通用小组件 ----------
+const Badge = {
+  props: { map: Object, value: String },
+  template: `<span class="badge" :class="(map[value] || [])[1]">{{ (map[value] || [value])[0] }}</span>`,
+};
+const Chips = {
+  props: { options: Array, modelValue: [String, Number], label: Function },
+  emits: ["update:modelValue"],
+  template: `<div class="chips"><button v-for="o in options" :key="o" type="button" class="chip" :class="{ on: o === modelValue }"
+    @click="$emit('update:modelValue', o)">{{ label ? label(o) : o }}</button></div>`,
+};
+const PageHead = {
+  props: { title: String, sub: String },
+  template: `<div class="page-head"><div><h1>{{ title }}</h1><div v-if="sub" class="muted small">{{ sub }}</div></div>
+    <div class="row"><slot /></div></div>`,
+};
+const DataTable = {
+  props: { cols: Array, rows: Array, empty: { type: String, default: "暂无数据" } },
+  template: `<table class="tbl"><thead><tr><th v-for="c in cols" :key="c.key" :class="c.cls">{{ c.label }}</th></tr></thead>
+    <tbody><tr v-if="!rows.length"><td :colspan="cols.length" class="muted">{{ empty }}</td></tr>
+    <tr v-for="(r, i) in rows" :key="i"><td v-for="c in cols" :key="c.key" :class="c.cls"><slot :name="c.key" :row="r">{{ c.fmt ? c.fmt(r[c.key], r) : r[c.key] }}</slot></td></tr>
+    </tbody></table>`,
+};
+
+// ---------- 新建短片 ----------
+const NewPage = {
+  components: { Chips, PageHead },
+  setup() {
+    const f = reactive({ description: "", style: "", ratio: "9:16", duration: 30, template: "" });
+    const templates = ref([]), assets = ref([]), picked = ref(new Set()), files = ref([]), busy = ref(false);
+    const tpl = computed(() => templates.value.find((t) => String(t.id) === String(f.template)) || null);
+    const tplAssetIds = computed(() => new Set(tpl.value ? tpl.value.asset_ids : []));
+    const previews = computed(() => files.value.map((x) => ({ name: x.name, url: URL.createObjectURL(x) })));
+    const warn = computed(() => {
+      const c = store.cfg, w = [];
+      if (!c.demo && (!c.keys.deepseek || !c.keys.ark)) w.push("服务器未配置 API Key，生成会失败。");
+      if (!c.demo && !c.priced) w.push("未配置模型单价，花费预估与 100 USD 熔断不生效。");
+      return w.join(" ");
+    });
+    watch(tpl, (t) => {
+      if (!t) return;
+      f.ratio = t.ratio; if ([15, 30, 45, 60].includes(t.duration)) f.duration = t.duration; f.style = t.style;
+    });
+    onMounted(async () => {
+      try { [templates.value, assets.value] = await Promise.all([api("/api/templates"), api("/api/assets")]); } catch (e) { fail(e); }
+      if (store.pendingTemplate) { f.template = String(store.pendingTemplate); store.pendingTemplate = null; }
+    });
+    const toggle = (a) => {
+      if (tplAssetIds.value.has(a.id)) return;
+      const s = new Set(picked.value); s.has(a.id) ? s.delete(a.id) : s.add(a.id); picked.value = s;
     };
-    q.addEventListener("input", () => { f.q = q.value; draw(); });
-    st.addEventListener("change", () => { f.status = st.value; draw(); });
-    draw();
-    box.className = "";
-    box.replaceChildren(h("div", { class: "row", style: "margin-bottom:12px" }, S.cfg.user ? whoChips : null, st, q), grid);
-  } catch (e) { fail(e); }
-  function card(p) {
-    return (h("a", { class: "pcard", href: `#/p/${p.id}` },
-      h("div", { class: "row spread" }, badge(P_STATUS, p.status), h("span", { class: "muted small" }, p.ratio)),
-      h("div", { class: "t" }, p.title),
-      h("div", { class: "muted small" }, `${p.created_at.slice(5, 16)} · ${p.shots} 个镜头 · 已花 ${usd(p.cost.spent_usd)}`, p.owner ? ` · ${p.owner}` : ""),
-    ));
-  }
-}
-
-function newForm(templates = [], assets = []) {
-  const ratios = S.cfg.ratios;
-  let ratio = "9:16", duration = 30, tpl = null;
-  const picked = new Set();
-  const ratioChips = h("div", { class: "chips" });
-  const durChips = h("div", { class: "chips" });
-  const drawChips = () => {
-    ratioChips.replaceChildren(...ratios.map((r) => h("button", { type: "button", class: "chip" + (r === ratio ? " on" : ""), onclick: () => { ratio = r; drawChips(); } }, r)));
-    durChips.replaceChildren(...[15, 30, 45, 60].map((d) => h("button", { type: "button", class: "chip" + (d === duration ? " on" : ""), onclick: () => { duration = d; drawChips(); } }, `${d} 秒`)));
-  };
-  drawChips();
-  const refsPreview = h("div", { class: "refs" });
-  const fileInput = h("input", { type: "file", name: "refs", accept: "image/png,image/jpeg,image/webp", multiple: true,
-    onchange: () => refsPreview.replaceChildren(...[...fileInput.files].slice(0, 4).map((f) => h("img", { src: URL.createObjectURL(f), alt: f.name }))) });
-  const tplInfo = h("div", { class: "muted small" });
-  const tplSelect = h("select", {}, h("option", { value: "" }, "不使用模板"), templates.map((x) => h("option", { value: x.id }, x.name)));
-  const applyTpl = () => {
-    tpl = templates.find((x) => String(x.id) === tplSelect.value) || null;
-    if (tpl) {
-      ratio = tpl.ratio; duration = [15, 30, 45, 60].includes(tpl.duration) ? tpl.duration : duration;
-      style.value = tpl.style; drawChips();
-      tplInfo.replaceChildren(
-        tpl.characters.length ? h("div", {}, "固定角色：", tpl.characters.map((c) => `${c.name}（${c.appearance}）`).join("；")) : null,
-        tpl.assets.length ? h("div", {}, "自带素材：", tpl.assets.map((a) => a.name).join("、")) : null);
-      if (!desc.value.trim() && tpl.description) desc.placeholder = "参考：" + tpl.description;
-    } else tplInfo.replaceChildren();
-    drawAssets();
-  };
-  tplSelect.addEventListener("change", applyTpl);
-  const assetGrid = h("div", { class: "pick-grid" });
-  const drawAssets = () => {
-    const fromTpl = new Set(tpl ? tpl.asset_ids : []);
-    assetGrid.replaceChildren(...assets.map((a) => {
-      const on = picked.has(a.id) || fromTpl.has(a.id);
-      return h("button", { type: "button", class: "pick" + (on ? " on" : ""), title: `${a.kind} · ${a.name}`, disabled: fromTpl.has(a.id),
-        onclick: () => { picked.has(a.id) ? picked.delete(a.id) : picked.add(a.id); drawAssets(); } },
-        h("img", { src: a.url, alt: a.name, loading: "lazy" }), h("span", {}, a.name));
-    }));
-  };
-  drawAssets();
-  if (S.pendingTemplate) { setTimeout(() => { tplSelect.value = String(S.pendingTemplate); S.pendingTemplate = null; applyTpl(); }, 0); }
-  const desc = h("textarea", { name: "description", rows: 3, placeholder: "例如：社区咖啡店的清晨，店主小林开门、做第一杯拿铁、递给熟客，温暖治愈" });
-  const style = h("input", { type: "text", name: "style", placeholder: "可选，例如：日系胶片感、暖色调" });
-  const submit = h("button", { class: "primary", type: "submit" }, "生成脚本");
-  const warn = [];
-  if (!S.cfg.demo && (!S.cfg.keys.deepseek || !S.cfg.keys.ark)) warn.push("服务器未配置 API Key，生成会失败。");
-  if (!S.cfg.demo && !S.cfg.priced) warn.push("未配置模型单价，花费预估与 100 USD 熔断不生效。");
-  return h("form", { class: "panel stack", onsubmit: async (ev) => {
-      ev.preventDefault();
+    const onFiles = (e) => { files.value = [...e.target.files].slice(0, 4); };
+    async function submit() {
+      if (f.description.trim().length < 4) return toast("请先描述一下场景", true);
       const fd = new FormData();
-      fd.set("description", desc.value.trim()); fd.set("style", style.value.trim());
-      fd.set("ratio", ratio); fd.set("duration", duration);
-      for (const f of [...fileInput.files].slice(0, 4)) fd.append("refs", f);
-      if (tpl) fd.set("template_id", tpl.id);
-      if (picked.size) fd.set("asset_ids", [...picked].join(","));
-      submit.disabled = true;
-      try { const p = await api("/api/projects", { method: "POST", form: fd }); location.hash = `#/p/${p.id}`; }
-      catch (e) { fail(e); submit.disabled = false; }
-    } },
-    h("h2", {}, "新建短片"),
-    warn.length ? h("div", { class: "warnline" }, warn.join(" ")) : null,
-    templates.length ? h("div", { class: "grid2" }, h("div", {}, h("label", {}, "风格模板"), tplSelect), h("div", { style: "align-self:end" }, tplInfo)) : null,
-    h("div", {}, h("label", {}, "场景描述"), desc),
-    h("div", { class: "grid2" },
-      h("div", {}, h("label", {}, "画幅"), ratioChips),
-      h("div", {}, h("label", {}, "目标时长"), durChips)),
-    h("div", {}, h("label", {}, "风格"), style),
-    assets.length ? h("div", {}, h("label", {}, "从素材库选参考图"), assetGrid) : null,
-    h("div", {}, h("label", {}, "上传参考图（角色 / 产品 / 风格；与素材库合计最多 4 张）"), fileInput, refsPreview),
-    h("div", { class: "row spread" }, h("span", { class: "muted small" }, `单片花费上限 $${S.cfg.budget_usd}`), submit),
-  );
-}
+      fd.set("description", f.description.trim()); fd.set("style", f.style.trim());
+      fd.set("ratio", f.ratio); fd.set("duration", f.duration);
+      files.value.forEach((x) => fd.append("refs", x));
+      if (tpl.value) fd.set("template_id", tpl.value.id);
+      if (picked.value.size) fd.set("asset_ids", [...picked.value].join(","));
+      busy.value = true;
+      try { const p = await api("/api/projects", { method: "POST", form: fd }); go(`#/p/${p.id}`); }
+      catch (e) { fail(e); busy.value = false; }
+    }
+    return { f, templates, assets, picked, tpl, tplAssetIds, previews, warn, toggle, onFiles, submit, busy, cfg: store.cfg };
+  },
+  template: `<div class="page">
+    <PageHead title="新建短片" sub="描述场景，系统先写分镜脚本，确认后再出图、生成视频" />
+    <div class="panel stack">
+      <div v-if="warn" class="warnline">{{ warn }}</div>
+      <div v-if="templates.length" class="grid2">
+        <div><label>风格模板</label><select v-model="f.template"><option value="">不使用模板</option>
+          <option v-for="t in templates" :key="t.id" :value="String(t.id)">{{ t.name }}</option></select></div>
+        <div v-if="tpl" class="muted small" style="align-self:end">
+          <div v-if="tpl.characters.length">固定角色：{{ tpl.characters.map(c => c.name + '（' + c.appearance + '）').join('；') }}</div>
+          <div v-if="tpl.assets.length">自带素材：{{ tpl.assets.map(a => a.name).join('、') }}</div>
+        </div>
+      </div>
+      <div><label>场景描述</label>
+        <textarea v-model="f.description" rows="4" :placeholder="tpl && tpl.description ? '参考：' + tpl.description : '例如：社区咖啡店的清晨，店主小林开门、做第一杯拿铁、递给熟客，温暖治愈'"></textarea></div>
+      <div class="grid2">
+        <div><label>画幅</label><Chips :options="cfg.ratios" v-model="f.ratio" /></div>
+        <div><label>目标时长</label><Chips :options="[15, 30, 45, 60]" v-model="f.duration" :label="d => d + ' 秒'" /></div>
+      </div>
+      <div><label>风格</label><input type="text" v-model="f.style" placeholder="可选，例如：日系胶片感、暖色调"></div>
+      <div v-if="assets.length"><label>从素材库选参考图</label>
+        <div class="pick-grid"><button v-for="a in assets" :key="a.id" type="button" class="pick"
+          :class="{ on: picked.has(a.id) || tplAssetIds.has(a.id) }" :title="a.kind + ' · ' + a.name" @click="toggle(a)">
+          <img :src="a.url" :alt="a.name" loading="lazy"><span>{{ a.name }}</span></button></div></div>
+      <div><label>上传参考图（角色 / 产品 / 风格；与素材库合计最多 4 张）</label>
+        <input type="file" accept="image/png,image/jpeg,image/webp" multiple @change="onFiles">
+        <div class="refs" v-if="previews.length"><img v-for="p in previews" :key="p.url" :src="p.url" :alt="p.name"></div></div>
+      <div class="row spread"><span class="muted small">单片花费上限 \${{ cfg.budget_usd }}</span>
+        <button class="primary" :disabled="busy" @click="submit">{{ busy ? '提交中…' : '生成脚本' }}</button></div>
+    </div></div>`,
+};
 
-// ---------- 项目页 ----------
-async function projectPage(pid) {
-  $("#app").replaceChildren(h("div", { id: "phead" }), h("div", { id: "pbanner" }), h("div", { id: "ptabs" }), h("div", { id: "pbody" }));
-  openEvents(pid);
-  await refresh(pid);
-}
+// ---------- 短片列表 ----------
+const ListPage = {
+  components: { Badge, Chips, PageHead },
+  setup() {
+    const items = ref(null);
+    const f = store.listFilter || (store.listFilter = reactive({ who: "all", status: "", q: "" }));
+    onMounted(async () => { try { items.value = await api("/api/projects"); } catch (e) { fail(e); items.value = []; } });
+    const shown = computed(() => {
+      if (!items.value) return [];
+      const kw = f.q.trim().toLowerCase();
+      return items.value.filter((p) => (f.who === "all" || p.owner === store.cfg.user) && (!f.status || p.status === f.status)
+        && (!kw || p.title.toLowerCase().includes(kw) || (p.owner || "").toLowerCase().includes(kw)));
+    });
+    return { items, shown, f, P_STATUS, usd, go, user: store.cfg.user };
+  },
+  template: `<div class="page">
+    <PageHead title="全部短片" :sub="items ? items.length + ' 部' : ''"><button class="primary" @click="go('#/new')">新建短片</button></PageHead>
+    <div class="toolbar">
+      <Chips v-if="user" :options="['all', 'mine']" v-model="f.who" :label="v => v === 'all' ? '全部' : '我的'" />
+      <select v-model="f.status" style="max-width:160px"><option value="">全部状态</option>
+        <option v-for="(v, k) in P_STATUS" :key="k" :value="k">{{ v[0] }}</option></select>
+      <input type="text" v-model="f.q" placeholder="搜索标题或成员" style="max-width:240px">
+    </div>
+    <div v-if="items === null" class="muted">加载中…</div>
+    <div v-else-if="!items.length" class="panel empty">还没有短片。<a href="#/new">新建一部</a></div>
+    <div v-else-if="!shown.length" class="muted">没有符合条件的短片</div>
+    <div v-else class="plist">
+      <a v-for="p in shown" :key="p.id" class="pcard" :href="'#/p/' + p.id">
+        <div class="row spread"><Badge :map="P_STATUS" :value="p.status" /><span class="muted small">{{ p.ratio }}</span></div>
+        <div class="t">{{ p.title }}</div>
+        <div class="muted small">{{ p.created_at.slice(5, 16) }} · {{ p.shots }} 个镜头 · 已花 {{ usd(p.cost.spent_usd) }}<span v-if="p.owner"> · {{ p.owner }}</span></div>
+      </a>
+    </div></div>`,
+};
 
-// 实时推送：服务端有变化就推 update；连接失败时退回 2 秒轮询
-function openEvents(pid) {
-  closeEvents();
-  if (!window.EventSource) return;
-  S.sseOk = false;
-  let pending = null;
-  const es = new EventSource(`${BASE}/api/projects/${pid}/events`);
-  es.onopen = () => { S.sseOk = true; };
-  es.addEventListener("update", () => {
-    clearTimeout(pending);
-    pending = setTimeout(() => { if (location.hash.includes(pid)) refresh(pid); }, 150);
-  });
-  es.onerror = () => { S.sseOk = false; };
-  S.es = es;
-}
-function closeEvents() { if (S.es) { S.es.close(); S.es = null; } S.sseOk = false; }
-
-async function refresh(pid) {
-  clearTimeout(S.pollTimer);
-  try { S.project = await api(`/api/projects/${pid}`); }
-  catch (e) { $("#app").replaceChildren(h("div", { class: "empty" }, e.message, h("p", {}, h("a", { href: "#/" }, "返回首页")))); return; }
-  if (!location.hash.includes(pid)) return;
-  drawProject();
-  if (S.project.job && !S.sseOk) S.pollTimer = setTimeout(() => refresh(pid), 2000);
-}
-
-function defaultTab(p) {
-  if (["imaging", "image_review", "image_selected"].includes(p.status)) return "images";
-  if (["generating", "shot_review"].includes(p.status)) return "videos";
-  if (["rendering", "done"].includes(p.status)) return "final";
-  return "script";
-}
-
-function drawProject() {
-  const p = S.project;
-  if (!S.tab) S.tab = defaultTab(p);
-  const busy = !!p.job || !p.can_edit;
-  // 头部
-  const c = p.cost, pct = Math.min(100, (c.spent_usd / c.budget_usd) * 100);
-  const meterCls = "meter" + (c.spent_usd >= c.budget_usd ? " over" : c.spent_usd >= S.cfg.budget_warn_usd ? " warn" : "");
-  $("#phead").replaceChildren(h("div", { class: "panel" },
-    h("div", { class: "row spread" },
-      h("div", { class: "grow" },
-        h("div", { class: "row small" }, h("a", { href: "#/" }, "← 全部短片"),
-          h("button", { class: "ghost small", onclick: duplicate }, "复制"),
-          p.can_edit ? h("button", { class: "ghost small danger", disabled: !!p.job, onclick: remove }, "删除") : null),
-        h("div", { class: "row", style: "margin-top:6px" }, h("h1", {}, p.title), badge(P_STATUS, p.status))),
-      h("div", { style: "min-width:220px" },
-        h("div", { class: "row spread small" }, h("span", {}, `已花 ${usd(c.spent_usd)}`), h("span", { class: "muted" }, `上限 ${usd(c.budget_usd)}`)),
-        h("div", { class: meterCls }, h("span", { style: `width:${pct}%` }), h("i", { style: `left:${(S.cfg.budget_warn_usd / c.budget_usd) * 100}%` })),
-        p.estimate ? h("div", { class: "muted small", style: "margin-top:4px" },
-          `整片预估 ${usd(p.estimate.total_usd)}`, p.estimate.priced ? "" : "（未配置单价）") : null)),
-    h("details", { style: "margin-top:10px" }, h("summary", {}, "需求与参考图"),
-      h("p", {}, p.brief.description), h("p", { class: "muted small" }, `${p.ratio} · 约 ${p.brief.duration} 秒`, p.brief.style ? ` · ${p.brief.style}` : ""),
-      h("div", { class: "refs" }, p.brief.refs.map((u) => h("img", { src: u, alt: "参考图" })))),
-  ));
-  // 任务横幅
-  const j = p.job || (p.last_job && p.last_job.status === "failed" ? p.last_job : null);
-  $("#pbanner").replaceChildren(!p.can_edit ? h("div", { class: "banner" }, h("div", {}, `只读：这是 ${p.owner} 的项目，只有本人或管理员可以修改。可以另存为模板或把场景图存入素材库。`)) : "", j ? h("div", { class: "banner" + (j.status === "failed" ? " bad" : "") },
-    j.status === "failed" ? null : h("div", { class: "spin" }),
-    h("div", { class: "grow" },
-      h("div", { class: "row spread" },
-        h("strong", {}, j.status === "failed" ? `${j.label}失败：${j.error || ""}` : `${j.label}${j.status === "queued" ? "（排队中）" : "中…"}`),
-        j.status !== "failed" && p.can_edit ? h("button", { class: "ghost small danger", onclick: () => cancelJob(j.id) }, "取消") : null),
-      h("pre", {}, (j.log || "").trim().split("\n").slice(-6).join("\n")))) : "");
-  // 标签页
-  const shots = p.shots, nSel = shots.filter((s) => s.state.selected).length, nVid = shots.filter((s) => s.state.video).length;
-  const tabs = [["script", "① 脚本", shots.length ? `${shots.length} 镜` : ""], ["images", "② 场景图", shots.length ? `${nSel}/${shots.length}` : ""],
-    ["videos", "③ 视频", shots.length ? `${nVid}/${shots.length}` : ""], ["final", "④ 成片", p.final ? "✓" : ""]];
-  $("#ptabs").replaceChildren(h("div", { class: "tabs" }, tabs.map(([k, t, n]) =>
-    h("button", { class: "tab" + (S.tab === k ? " on" : ""), onclick: () => { S.tab = k; drawProject(); } }, t, n ? h("span", { class: "n" }, n) : null))));
-  // 主体（编辑中的脚本不被轮询覆盖；内容没变不重绘，避免视频重新加载）
-  const sig = JSON.stringify([S.tab, busy, p.shots, p.final, p.script, p.has_bgm, p.status]);
-  if (S.tab === "script" && S.dirty && S.bodyTab === "script") return;
-  if (sig === S.bodySig) return;
-  S.bodySig = sig; S.bodyTab = S.tab;
-  const body = { script: scriptTab, images: imagesTab, videos: videosTab, final: finalTab }[S.tab](p, busy);
-  $("#pbody").replaceChildren(body);
-}
-
-async function cancelJob(id) {
-  if (!confirm("取消这个任务？已经完成的图和视频会保留；正在生成的视频会尝试在方舟侧取消（已开始生成的可能仍会计费）。")) return;
-  try {
-    const r = await api(`/api/jobs/${id}/cancel`, { method: "POST" });
-    toast(r.status === "cancelled" ? "已取消" : "正在停止，当前步骤完成后结束");
-    await refresh(S.project.id);
-  } catch (e) { fail(e); }
-}
-
-async function duplicate() {
-  const p = S.project;
-  if (!confirm("复制这部短片的需求和脚本（不复制图和视频），用来做变体？")) return;
-  try { const n = await api(`/api/projects/${p.id}/duplicate`, { method: "POST" }); toast("已复制"); location.hash = `#/p/${n.id}`; }
-  catch (e) { fail(e); }
-}
-async function remove() {
-  const p = S.project;
-  if (!confirm(`删除「${p.title}」？会移到服务器回收站（data/trash），管理员可找回。`)) return;
-  try { await api(`/api/projects/${p.id}`, { method: "DELETE" }); toast("已删除"); location.hash = "#/"; }
-  catch (e) { fail(e); }
-}
-
-async function startJob(kind, extra = {}) {
-  const p = S.project;
-  try { await api(`/api/projects/${p.id}/jobs`, { method: "POST", body: { kind, ...extra } }); toast("已开始"); await refresh(p.id); }
-  catch (e) { fail(e); }
-}
-
-// ---------- ① 脚本 ----------
-function scriptTab(p, busy) {
-  if (!p.script) {
-    return h("div", { class: "panel empty" }, busy ? "DeepSeek 正在写脚本，通常需要 20–60 秒…" : "还没有脚本",
-      !busy ? h("p", {}, h("button", { class: "primary", onclick: () => startJob("script") }, "生成脚本")) : null);
-  }
-  if (!S.draft) S.draft = JSON.parse(JSON.stringify({ ...p.script, shots: p.shots.map(({ state, index, ...s }) => s) }));
-  const d = S.draft, dis = busy;
-  const touch = () => { if (!S.dirty) { S.dirty = true; saveBtn.disabled = false; } };
-  const field = (obj, key, el) => { el.value = obj[key] ?? ""; el.disabled = dis; el.addEventListener("input", () => { obj[key] = el.value; touch(); }); return el; };
-  const ta = (rows) => h("textarea", { rows });
-  const redraw = () => { const sig = S.dirty; $("#pbody").replaceChildren(scriptTab(p, busy)); S.dirty = sig; if (sig) saveBtnRef().disabled = false; };
-
-  const chars = h("div", { class: "stack" }, d.characters.map((ch, i) => h("div", { class: "grid3" },
-    h("div", { class: "stack" }, h("div", {}, h("label", {}, "角色名"), field(ch, "name", h("input", { type: "text" }))),
-      h("div", {}, h("label", {}, "配音音色（可选，台词用）"), field(ch, "voice", h("input", { type: "text", placeholder: "voice_type" })))),
-    h("div", { style: "grid-column: span 2" }, h("label", { class: "row spread" }, "固定外观描述",
-      dis ? null : h("button", { class: "ghost danger small", type: "button", onclick: () => { d.characters.splice(i, 1); touch(); redraw(); } }, "删除")),
-      field(ch, "appearance", ta(2))))));
-
-  const shotCards = d.shots.map((s, i) => {
-    const st = (p.shots.find((x) => x.id === s.id) || {}).state;
-    const dur = h("select", {}, S.cfg.durations.map((v) => h("option", { value: v, selected: Number(s.duration) === v }, `${v} 秒`)));
-    dur.disabled = dis; dur.addEventListener("change", () => { s.duration = Number(dur.value); touch(); });
-    const charsInput = h("input", { type: "text", placeholder: "用逗号分隔，需与上方角色名一致" });
-    charsInput.value = (s.characters || []).join("，"); charsInput.disabled = dis;
-    charsInput.addEventListener("input", () => { s.characters = charsInput.value.split(/[,，、\s]+/).filter(Boolean); touch(); });
-    const move = (delta) => { const j = i + delta; if (j < 0 || j >= d.shots.length) return; [d.shots[i], d.shots[j]] = [d.shots[j], d.shots[i]]; touch(); redraw(); };
-    return h("div", { class: "shot" },
-      h("div", { class: "shot-head" }, h("span", { class: "num" }, i + 1),
-        h("div", { class: "grow" }, field(s, "description", h("input", { type: "text", placeholder: "镜头简述" }))),
-        st ? badge(S_STATUS, st.status) : h("span", { class: "badge" }, "新镜头"),
-        dis ? null : [h("button", { class: "ghost", type: "button", title: "上移", onclick: () => move(-1) }, "↑"),
-          h("button", { class: "ghost", type: "button", title: "下移", onclick: () => move(1) }, "↓"),
-          h("button", { class: "ghost danger", type: "button", onclick: () => { if (d.shots.length > 1) { d.shots.splice(i, 1); touch(); redraw(); } } }, "删除")]),
-      h("div", { class: "grid2" },
-        h("div", {}, h("label", {}, "场景图提示词（静态画面）"), field(s, "image_prompt", ta(3))),
-        h("div", {}, h("label", {}, "视频提示词（怎么动）"), field(s, "video_prompt", ta(3)))),
-      h("div", { class: "grid3", style: "margin-top:10px" },
-        h("div", {}, h("label", {}, "时长"), dur),
-        h("div", {}, h("label", {}, "出场角色"), charsInput),
-        h("div", {}, h("label", {}, "旁白 / 台词（也作字幕）"), field(s, "narration", h("input", { type: "text" })),
-          d.characters.length ? speakerSel(s) : null)),
-      i < d.shots.length - 1 ? h("label", { class: "check" }, linkBox(s),
-        "平滑过渡到下一镜（用下一镜的场景图做尾帧，适合同一场景的连续动作）") : null);
-  });
-  function speakerSel(s) {
-    const sel = h("select", { style: "margin-top:6px" }, h("option", { value: "" }, "说话人：画外旁白"),
-      d.characters.filter((c) => c.name).map((c) => h("option", { value: c.name, selected: s.speaker === c.name }, `说话人：${c.name}`)));
-    sel.disabled = dis;
-    sel.addEventListener("change", () => { s.speaker = sel.value; touch(); });
-    return sel;
-  }
-  function linkBox(s) {
-    const cb = h("input", { type: "checkbox", checked: !!s.link_next, disabled: dis });
-    cb.addEventListener("change", () => { s.link_next = cb.checked; touch(); });
-    return cb;
-  }
-
-  const saveBtn = h("button", { id: "saveBtn", disabled: true, onclick: () => save(false) }, "保存");
-  const saveBtnRef = () => $("#saveBtn") || saveBtn;
-  const total = d.shots.reduce((a, s) => a + Number(s.duration || 0), 0);
-  async function saveTemplate() {
-    if (S.dirty) return toast("先保存脚本修改，再另存为模板", true);
-    const name = prompt("模板名称", p.title);
-    if (!name) return;
-    try { await api("/api/templates", { method: "POST", body: { from_project: p.id, name } }); toast("已存为模板，新建短片时可选用"); }
-    catch (e) { fail(e); }
-  }
-  async function save(thenImages) {
-    try {
-      if (S.dirty) {
-        S.project = await api(`/api/projects/${p.id}/script`, { method: "PUT", body: S.draft });
-        S.dirty = false; S.draft = null; S.bodySig = "";
-        toast("已保存");
-      }
-      if (thenImages) { S.tab = "images"; await startJob("images"); } else drawProject();
-    } catch (e) { fail(e); }
-  }
-  return h("div", {},
-    h("div", { class: "panel stack" },
-      h("div", { class: "row spread" }, h("h2", {}, "整体设定"), h("div", { class: "row" },
-        h("span", { class: "muted small" }, `${d.shots.length} 个镜头 · 共 ${total} 秒`),
-        h("button", { class: "ghost", type: "button", onclick: saveTemplate }, "另存为模板"))),
-      h("div", {}, h("label", {}, "标题"), field(d, "title", h("input", { type: "text" }))),
-      h("div", {}, h("label", {}, "全片风格（拼接到每张场景图提示词前）"), field(d, "style", ta(2))),
-      h("div", {}, h("label", {}, "角色"), chars,
-        dis ? null : h("button", { class: "ghost", type: "button", onclick: () => { d.characters.push({ name: "", appearance: "" }); touch(); redraw(); } }, "+ 添加角色"))),
-    h("h2", {}, "分镜"),
-    shotCards,
-    dis ? null : h("button", { class: "ghost", type: "button", style: "margin-top:10px",
-      onclick: () => { d.shots.push({ description: "", characters: [], image_prompt: "", video_prompt: "", duration: S.cfg.durations[0], narration: "" }); touch(); redraw(); } }, "+ 添加镜头"),
-    h("div", { class: "actions" },
-      h("button", { disabled: dis, onclick: () => { if (confirm("重新生成会覆盖当前脚本和所有素材记录，确定？")) startJob("script"); } }, "重新生成脚本"),
-      saveBtn,
-      h("button", { class: "primary", disabled: dis, onclick: () => save(true) }, "保存并生成场景图")));
-}
-
-// ---------- ② 场景图 ----------
-function imagesTab(p, busy) {
-  if (!p.shots.length) return h("div", { class: "panel empty" }, "先完成脚本");
-  const allSel = p.shots.every((s) => s.state.selected);
-  const anyCand = p.shots.some((s) => s.state.candidates.length);
-  const pick = async (s, n) => {
-    try { S.project = await api(`/api/projects/${p.id}/select`, { method: "POST", body: { shot_id: s.id, candidate: n } }); S.bodySig = ""; drawProject(); }
-    catch (e) { fail(e); }
-  };
-  const rows = p.shots.map((s) => {
-    const st = s.state;
-    const cands = st.candidates.length ? st.candidates.map((u, i) =>
-      h("button", { class: "cand" + (st.selected === i + 1 ? " on" : ""), style: `aspect-ratio:${ratioCss(p.ratio)}`, disabled: busy,
-        title: st.refined && st.refined[i] ? `修改：${st.refined[i]}` : `候选 ${i + 1}`, onclick: () => pick(s, i + 1) },
-        h("img", { src: u, loading: "lazy", alt: `第 ${s.index} 镜候选 ${i + 1}` }),
-        st.refined && st.refined[i] ? h("span", { class: "tag" }, "改") : null))
-      : [h("div", { class: "placeholder", style: `aspect-ratio:${ratioCss(p.ratio)}` }, st.status === "imaging" ? "出图中…" : "未出图")];
-    return h("div", { class: "shot" },
-      h("div", { class: "shot-head" }, h("span", { class: "num" }, s.index), h("strong", { class: "grow" }, s.description || "（无简述）"),
-        badge(S_STATUS, st.status),
-        h("button", { disabled: busy, onclick: () => startJob("images", { shots: [s.index] }) }, st.candidates.length ? "重出这一镜" : "出图")),
-      h("div", { class: "muted small", style: "margin-bottom:8px" }, s.image_prompt),
-      st.image_stale ? h("div", { class: "warnline" }, "提示词已修改，建议重出这一镜") : null,
-      st.error ? h("div", { class: "errline" }, st.error) : null,
-      h("div", { class: "cands" }, cands),
-      st.selected ? refineBox(s) : null);
-  });
-  function refineBox(s) {
-    const input = h("input", { type: "text", placeholder: "例如：人物换成侧脸、背景加一盏暖色吊灯、去掉桌上的杯子", disabled: busy });
-    const go = () => {
-      const v = input.value.trim();
-      if (v.length < 2) return toast("写一下要怎么改", true);
-      startJob("refine", { shot: s.index, candidate: s.state.selected, instruction: v });
+// ---------- 项目：四个步骤 ----------
+const ScriptTab = {
+  props: { p: Object, busy: Boolean },
+  emits: ["job", "saved"],
+  setup(props, { emit }) {
+    const draft = ref(null), dirty = ref(false);
+    const build = () => {
+      draft.value = JSON.parse(JSON.stringify({ ...props.p.script,
+        shots: props.p.shots.map(({ state, index, ...s }) => ({ ...s, characters: s.characters || [] })) }));
+      draft.value.characters.forEach((c) => { if (c.voice === undefined) c.voice = ""; });
+      nextTick(() => (dirty.value = false));
     };
-    input.addEventListener("keydown", (e) => { if (e.key === "Enter") go(); });
-    return h("div", { class: "row", style: "margin-top:10px" },
-      h("div", { class: "grow" }, input),
-      h("button", { disabled: busy, onclick: go }, "基于选中图修改"),
-      h("button", { class: "ghost small", onclick: () => saveAsset(s) }, "存入素材库"));
-  }
-  async function saveAsset(s) {
-    const name = prompt("素材名称", s.description || `第 ${s.index} 镜`);
-    if (!name) return;
-    const kind = prompt(`类型（${S.cfg.asset_kinds.join(" / ")}）`, "场景");
-    if (!kind) return;
-    try { await api(`/api/projects/${p.id}/save-asset`, { method: "POST", body: { shot_id: s.id, name, kind } }); toast("已存入素材库"); }
-    catch (e) { fail(e); }
-  }
-  return h("div", {},
-    rows,
-    h("div", { class: "actions" },
-      h("button", { disabled: busy, onclick: () => startJob("images") }, anyCand ? "补齐未出图的镜头" : "生成全部场景图"),
-      h("button", { class: "primary", disabled: busy || !allSel,
-        title: allSel ? "" : "每个镜头都选好图后才能生成视频",
-        onclick: () => { S.tab = "videos"; startJob("videos"); } }, allSel ? "生成镜头视频" : `还有 ${p.shots.filter((s) => !s.state.selected).length} 镜未选图`)));
-}
+    watch(() => props.p, () => { if (props.p.script && (!dirty.value || !draft.value)) build(); }, { immediate: true });
+    watch(draft, () => (dirty.value = true), { deep: true });
+    const total = computed(() => draft.value ? draft.value.shots.reduce((a, s) => a + Number(s.duration || 0), 0) : 0);
+    const stateOf = (s) => (props.p.shots.find((x) => x.id === s.id) || {}).state;
+    const move = (i, d) => { const a = draft.value.shots, j = i + d; if (j < 0 || j >= a.length) return; [a[i], a[j]] = [a[j], a[i]]; };
+    const addShot = () => draft.value.shots.push({ description: "", characters: [], image_prompt: "", video_prompt: "",
+      duration: store.cfg.durations[0], narration: "", speaker: "", link_next: false });
+    const charsText = (s) => (s.characters || []).join("，");
+    const setChars = (s, v) => { s.characters = v.split(/[,，、\s]+/).filter(Boolean); };
+    async function save(thenImages) {
+      try {
+        if (dirty.value) {
+          const p = await api(`/api/projects/${props.p.id}/script`, { method: "PUT", body: draft.value });
+          dirty.value = false; emit("saved", p); toast("已保存");
+        }
+        if (thenImages) emit("job", "images", {}, "images");
+      } catch (e) { fail(e); }
+    }
+    async function saveTemplate() {
+      if (dirty.value) return toast("先保存脚本修改，再另存为模板", true);
+      const name = prompt("模板名称", props.p.title);
+      if (!name) return;
+      try { await api("/api/templates", { method: "POST", body: { from_project: props.p.id, name } }); toast("已存为模板"); }
+      catch (e) { fail(e); }
+    }
+    const regen = () => { if (confirm("重新生成会覆盖当前脚本和所有素材记录，确定？")) emit("job", "script"); };
+    return { draft, dirty, total, stateOf, move, addShot, charsText, setChars, save, saveTemplate, regen, S_STATUS, cfg: store.cfg };
+  },
+  components: { Badge },
+  template: `<div v-if="!p.script" class="panel empty">{{ busy ? 'DeepSeek 正在写脚本，通常需要 20–60 秒…' : '还没有脚本' }}
+      <p v-if="!busy"><button class="primary" @click="$emit('job', 'script')">生成脚本</button></p></div>
+    <div v-else-if="draft">
+      <div class="panel stack">
+        <div class="row spread"><h2>整体设定</h2><div class="row"><span class="muted small">{{ draft.shots.length }} 个镜头 · 共 {{ total }} 秒</span>
+          <button class="ghost" @click="saveTemplate">另存为模板</button></div></div>
+        <div><label>标题</label><input type="text" v-model="draft.title" :disabled="busy"></div>
+        <div><label>全片风格（拼接到每张场景图提示词前）</label><textarea v-model="draft.style" rows="2" :disabled="busy"></textarea></div>
+        <div><label>角色</label>
+          <div v-for="(c, i) in draft.characters" :key="i" class="grid3" style="margin-bottom:10px">
+            <div class="stack"><div><label>角色名</label><input type="text" v-model="c.name" :disabled="busy"></div>
+              <div><label>配音音色（可选，台词用）</label><input type="text" v-model="c.voice" placeholder="voice_type" :disabled="busy"></div></div>
+            <div style="grid-column: span 2"><label class="row spread">固定外观描述
+              <button v-if="!busy" class="ghost danger small" @click="draft.characters.splice(i, 1)">删除</button></label>
+              <textarea v-model="c.appearance" rows="3" :disabled="busy"></textarea></div>
+          </div>
+          <button v-if="!busy" class="ghost" @click="draft.characters.push({ name: '', appearance: '', voice: '' })">+ 添加角色</button></div>
+      </div>
+      <h2>分镜</h2>
+      <div v-for="(s, i) in draft.shots" :key="s.id || 'new' + i" class="shot">
+        <div class="shot-head"><span class="num">{{ i + 1 }}</span>
+          <div class="grow"><input type="text" v-model="s.description" placeholder="镜头简述" :disabled="busy"></div>
+          <Badge v-if="stateOf(s)" :map="S_STATUS" :value="stateOf(s).status" /><span v-else class="badge">新镜头</span>
+          <template v-if="!busy"><button class="ghost" title="上移" @click="move(i, -1)">↑</button>
+            <button class="ghost" title="下移" @click="move(i, 1)">↓</button>
+            <button class="ghost danger" @click="draft.shots.length > 1 && draft.shots.splice(i, 1)">删除</button></template>
+        </div>
+        <div class="grid2">
+          <div><label>场景图提示词（静态画面）</label><textarea v-model="s.image_prompt" rows="3" :disabled="busy"></textarea></div>
+          <div><label>视频提示词（怎么动）</label><textarea v-model="s.video_prompt" rows="3" :disabled="busy"></textarea></div>
+        </div>
+        <div class="grid3" style="margin-top:10px">
+          <div><label>时长</label><select v-model.number="s.duration" :disabled="busy">
+            <option v-for="d in cfg.durations" :key="d" :value="d">{{ d }} 秒</option></select></div>
+          <div><label>出场角色</label><input type="text" :value="charsText(s)" @input="setChars(s, $event.target.value)"
+            placeholder="用逗号分隔，需与上方角色名一致" :disabled="busy"></div>
+          <div><label>旁白 / 台词（也作字幕）</label><input type="text" v-model="s.narration" :disabled="busy">
+            <select v-if="draft.characters.length" v-model="s.speaker" style="margin-top:6px" :disabled="busy">
+              <option value="">说话人：画外旁白</option>
+              <option v-for="c in draft.characters.filter(c => c.name)" :key="c.name" :value="c.name">说话人：{{ c.name }}</option></select></div>
+        </div>
+        <label v-if="i < draft.shots.length - 1" class="check"><input type="checkbox" v-model="s.link_next" :disabled="busy">
+          平滑过渡到下一镜（用下一镜的场景图做尾帧，适合同一场景的连续动作）</label>
+      </div>
+      <button v-if="!busy" class="ghost" style="margin-top:10px" @click="addShot">+ 添加镜头</button>
+      <div class="actions">
+        <button :disabled="busy" @click="regen">重新生成脚本</button>
+        <button :disabled="busy || !dirty" @click="save(false)">保存</button>
+        <button class="primary" :disabled="busy" @click="save(true)">保存并生成场景图</button>
+      </div>
+    </div>`,
+};
 
-// ---------- ③ 视频 ----------
-function videosTab(p, busy) {
-  if (!p.shots.length) return h("div", { class: "panel empty" }, "先完成脚本");
-  const allVid = p.shots.every((s) => s.state.video);
-  const rows = p.shots.map((s) => {
-    const st = s.state;
-    const frame = st.selected ? st.candidates[st.selected - 1] : null;
-    return h("div", { class: "shot" },
-      h("div", { class: "shot-head" }, h("span", { class: "num" }, s.index), h("strong", { class: "grow" }, s.description || "（无简述）"),
-        s.link_next && s.index < p.shots.length ? h("span", { class: "badge", title: "首尾帧过渡" }, `→ 过渡到第 ${s.index + 1} 镜`) : null,
-        h("span", { class: "muted small" }, `${s.duration} 秒`), badge(S_STATUS, st.status),
-        h("button", { disabled: busy || !st.selected, onclick: () => startJob("videos", { shots: [s.index] }) }, st.video ? "重生成" : "生成")),
-      h("div", { class: "row", style: "align-items:flex-start" },
-        st.video ? h("video", { class: "vid", src: st.video, controls: true, playsinline: true, preload: "metadata", poster: frame || undefined })
-          : frame ? h("img", { class: "vid", src: frame, alt: "首帧", style: "background:#eee" })
-            : h("div", { class: "placeholder", style: `aspect-ratio:${ratioCss(p.ratio)}` }, "未选图"),
-        h("div", { class: "grow small" },
-          h("div", { class: "muted" }, "视频提示词"), h("div", {}, s.video_prompt),
-          s.narration ? [h("div", { class: "muted", style: "margin-top:8px" }, "旁白"), h("div", {}, s.narration)] : null,
-          st.tasks > 1 ? h("div", { class: "muted", style: "margin-top:8px" }, `已生成 ${st.tasks} 次`) : null,
-          st.error ? h("div", { class: "errline", style: "margin-top:8px" }, st.error) : null)));
-  });
-  return h("div", {}, rows, h("div", { class: "actions" },
-    h("button", { disabled: busy || allVid, onclick: () => startJob("videos") }, "补齐缺失的镜头"),
-    h("button", { class: "primary", disabled: busy || !allVid, onclick: () => { S.tab = "final"; S.bodySig = ""; drawProject(); } }, "去合成成片")));
-}
+const ImagesTab = {
+  props: { p: Object, busy: Boolean },
+  emits: ["job", "update"],
+  components: { Badge },
+  setup(props, { emit }) {
+    const edits = reactive({});
+    const allSel = computed(() => props.p.shots.every((s) => s.state.selected));
+    const anyCand = computed(() => props.p.shots.some((s) => s.state.candidates.length));
+    const unselected = computed(() => props.p.shots.filter((s) => !s.state.selected).length);
+    async function pick(s, n) {
+      try { emit("update", await api(`/api/projects/${props.p.id}/select`, { method: "POST", body: { shot_id: s.id, candidate: n } })); }
+      catch (e) { fail(e); }
+    }
+    function refine(s) {
+      const v = (edits[s.id] || "").trim();
+      if (v.length < 2) return toast("写一下要怎么改", true);
+      emit("job", "refine", { shot: s.index, candidate: s.state.selected, instruction: v });
+      edits[s.id] = "";
+    }
+    async function saveAsset(s) {
+      const name = prompt("素材名称", s.description || `第 ${s.index} 镜`); if (!name) return;
+      const kind = prompt(`类型（${store.cfg.asset_kinds.join(" / ")}）`, "场景"); if (!kind) return;
+      try { await api(`/api/projects/${props.p.id}/save-asset`, { method: "POST", body: { shot_id: s.id, name, kind } }); toast("已存入素材库"); }
+      catch (e) { fail(e); }
+    }
+    return { edits, allSel, anyCand, unselected, pick, refine, saveAsset, ratioCss, S_STATUS };
+  },
+  template: `<div v-if="!p.shots.length" class="panel empty">先完成脚本</div>
+    <div v-else>
+      <div v-for="s in p.shots" :key="s.id" class="shot">
+        <div class="shot-head"><span class="num">{{ s.index }}</span><strong class="grow">{{ s.description || '（无简述）' }}</strong>
+          <Badge :map="S_STATUS" :value="s.state.status" />
+          <button :disabled="busy" @click="$emit('job', 'images', { shots: [s.index] })">{{ s.state.candidates.length ? '重出这一镜' : '出图' }}</button></div>
+        <div class="muted small" style="margin-bottom:8px">{{ s.image_prompt }}</div>
+        <div v-if="s.state.image_stale" class="warnline">提示词已修改，建议重出这一镜</div>
+        <div v-if="s.state.error" class="errline">{{ s.state.error }}</div>
+        <div class="cands">
+          <template v-if="s.state.candidates.length">
+            <button v-for="(u, i) in s.state.candidates" :key="u" class="cand" :class="{ on: s.state.selected === i + 1 }"
+              :style="{ aspectRatio: ratioCss(p.ratio) }" :disabled="busy" @click="pick(s, i + 1)"
+              :title="s.state.refined && s.state.refined[i] ? '修改：' + s.state.refined[i] : '候选 ' + (i + 1)">
+              <img :src="u" loading="lazy" :alt="'候选 ' + (i + 1)"><span v-if="s.state.refined && s.state.refined[i]" class="tag">改</span></button>
+          </template>
+          <div v-else class="placeholder" :style="{ aspectRatio: ratioCss(p.ratio) }">{{ s.state.status === 'imaging' ? '出图中…' : '未出图' }}</div>
+        </div>
+        <div v-if="s.state.selected" class="row" style="margin-top:10px">
+          <div class="grow"><input type="text" v-model="edits[s.id]" @keydown.enter="refine(s)" :disabled="busy"
+            placeholder="例如：人物换成侧脸、背景加一盏暖色吊灯、去掉桌上的杯子"></div>
+          <button :disabled="busy" @click="refine(s)">基于选中图修改</button>
+          <button class="ghost small" @click="saveAsset(s)">存入素材库</button></div>
+      </div>
+      <div class="actions">
+        <button :disabled="busy" @click="$emit('job', 'images')">{{ anyCand ? '补齐未出图的镜头' : '生成全部场景图' }}</button>
+        <button class="primary" :disabled="busy || !allSel" @click="$emit('job', 'videos', {}, 'videos')">
+          {{ allSel ? '生成镜头视频' : '还有 ' + unselected + ' 镜未选图' }}</button>
+      </div>
+    </div>`,
+};
 
-// ---------- ④ 成片 ----------
-function finalTab(p, busy) {
-  const allVid = p.shots.length && p.shots.every((s) => s.state.video);
-  const bgmInput = h("input", { type: "file", accept: ".mp3,.m4a,.aac,.wav" });
-  const upload = async () => {
-    if (!bgmInput.files.length) return toast("先选择音频文件", true);
-    const fd = new FormData(); fd.set("bgm", bgmInput.files[0]);
-    try { S.project = await api(`/api/projects/${p.id}/bgm`, { method: "POST", form: fd }); toast("BGM 已上传"); S.bodySig = ""; drawProject(); }
-    catch (e) { fail(e); }
-  };
-  const hasNarr = p.shots.some((s) => (s.narration || "").trim());
-  const ttsOn = h("input", { type: "checkbox", checked: S.cfg.tts.enabled && hasNarr, disabled: !S.cfg.tts.enabled || !hasNarr || busy });
-  const voice = h("input", { type: "text", value: S.cfg.tts.voice, disabled: !S.cfg.tts.enabled || busy, placeholder: "音色 voice_type" });
-  const meta = p.final_meta;
-  const burn = h("input", { type: "checkbox", checked: meta ? !!meta.burn_subs : false, disabled: !hasNarr || busy });
-  const fade = h("input", { type: "checkbox", checked: meta ? !!meta.transition : false, disabled: busy || p.shots.length < 2 });
-  const compose = () => startJob("compose", { bgm: p.has_bgm, tts: ttsOn.checked, voice: voice.value.trim(), burn_subs: burn.checked,
-    transition: fade.checked ? 0.5 : 0 });
-  const others = S.cfg.ratios.filter((r) => r !== p.ratio);
-  const exportPanel = p.final ? h("div", { class: "panel stack" },
-    h("h2", {}, "导出其他画幅"),
-    h("div", { class: "muted small" }, "不重新生成：原画面完整保留，空白处用同一画面放大模糊填充。适合把竖屏片发到横屏平台。"),
-    h("div", { class: "row" }, others.map((r) => p.exports && p.exports[r]
-      ? h("a", { href: p.exports[r], download: `${p.title}_${r.replace(":", "x")}.mp4` }, h("button", {}, `下载 ${r}`))
-      : h("button", { disabled: busy, onclick: () => startJob("export", { ratio: r }) }, `导出 ${r}`)))) : null;
-  return h("div", {},
-    h("div", { class: "panel" },
-      meta && p.final ? h("div", { class: "muted small", style: "text-align:center;margin-bottom:8px" },
-        [meta.tts ? `旁白配音（${meta.voice}）` : "无配音", meta.bgm ? "含 BGM" : "无 BGM", meta.burn_subs ? "字幕已烧录" : "软字幕",
-          meta.transition ? "淡入淡出转场" : "硬切"].join(" · ")) : null,
-      p.final ? [h("video", { class: "final", src: p.final, controls: true, playsinline: true }),
-        h("div", { class: "row", style: "justify-content:center;margin-top:12px" },
-          h("a", { href: p.final, download: `${p.title}.mp4` }, h("button", { class: "primary" }, "下载成片")),
-          h("a", { href: p.final.replace(/\.mp4$/, ".srt"), download: `${p.title}.srt` }, h("button", {}, "下载字幕")))]
-        : h("div", { class: "empty" }, busy ? "处理中…" : allVid ? "所有镜头已就绪，可以合成成片" : "还有镜头没有视频，先到「③ 视频」补齐")),
-    h("div", { class: "panel stack" },
-      h("h2", {}, "旁白配音"),
-      !S.cfg.tts.enabled ? h("div", { class: "muted small" }, "服务器未配置 TTS_APPID / TTS_TOKEN，旁白只作为字幕。")
-        : !hasNarr ? h("div", { class: "muted small" }, "脚本里没有旁白，可在「① 脚本」里填写。")
-          : h("div", { class: "muted small" }, "用火山引擎语音合成为每镜旁白配音，按镜头起点对齐；同样的文字和音色只合成一次。"),
-      h("label", { class: "check" }, ttsOn, "合成时加入旁白配音（设了说话人的镜头用该角色的音色）"),
-      h("label", { class: "check" }, burn, "把字幕烧进画面（抖音、视频号等平台不显示软字幕时勾选）"),
-      h("div", { style: "max-width:360px" }, h("label", {}, "音色（voice_type，见火山引擎音色列表）"), voice)),
-    h("div", { class: "panel stack" },
-      h("h2", {}, "剪辑"),
-      h("label", { class: "check" }, fade, "镜头之间 0.5 秒淡入淡出（成片会比镜头总时长略短，字幕和配音自动对齐）")),
-    exportPanel,
-    h("div", { class: "panel stack" },
-      h("h2", {}, "背景音乐（可选）"),
-      h("div", { class: "muted small" }, p.has_bgm ? "已上传 BGM，合成时混入（有配音时自动压低到 25%）" : "不上传则只有配音或无声"),
-      h("div", { class: "row" }, bgmInput, h("button", { onclick: upload, disabled: busy }, "上传"))),
-    h("div", { class: "actions" },
-      h("button", { class: "primary", disabled: busy || !allVid, onclick: compose }, p.final ? "重新合成" : "合成成片")));
-}
+const VideosTab = {
+  props: { p: Object, busy: Boolean },
+  emits: ["job", "tab"],
+  components: { Badge },
+  setup(props) {
+    const allVid = computed(() => props.p.shots.length && props.p.shots.every((s) => s.state.video));
+    const frame = (s) => (s.state.selected ? s.state.candidates[s.state.selected - 1] : null);
+    return { allVid, frame, ratioCss, S_STATUS };
+  },
+  template: `<div v-if="!p.shots.length" class="panel empty">先完成脚本</div>
+    <div v-else>
+      <div v-for="s in p.shots" :key="s.id" class="shot">
+        <div class="shot-head"><span class="num">{{ s.index }}</span><strong class="grow">{{ s.description || '（无简述）' }}</strong>
+          <span v-if="s.link_next && s.index < p.shots.length" class="badge">→ 过渡到第 {{ s.index + 1 }} 镜</span>
+          <span class="muted small">{{ s.duration }} 秒</span><Badge :map="S_STATUS" :value="s.state.status" />
+          <button :disabled="busy || !s.state.selected" @click="$emit('job', 'videos', { shots: [s.index] })">{{ s.state.video ? '重生成' : '生成' }}</button></div>
+        <div class="row" style="align-items:flex-start">
+          <video v-if="s.state.video" class="vid" :src="s.state.video" controls playsinline preload="metadata" :poster="frame(s) || undefined"></video>
+          <img v-else-if="frame(s)" class="vid" :src="frame(s)" alt="首帧" style="background:#eee">
+          <div v-else class="placeholder" :style="{ aspectRatio: ratioCss(p.ratio) }">未选图</div>
+          <div class="grow small">
+            <div class="muted">视频提示词</div><div>{{ s.video_prompt }}</div>
+            <template v-if="s.narration"><div class="muted" style="margin-top:8px">旁白</div><div>{{ s.narration }}</div></template>
+            <div v-if="s.state.tasks > 1" class="muted" style="margin-top:8px">已生成 {{ s.state.tasks }} 次</div>
+            <div v-if="s.state.error" class="errline" style="margin-top:8px">{{ s.state.error }}</div>
+          </div>
+        </div>
+      </div>
+      <div class="actions">
+        <button :disabled="busy || allVid" @click="$emit('job', 'videos')">补齐缺失的镜头</button>
+        <button class="primary" :disabled="busy || !allVid" @click="$emit('tab', 'final')">去合成成片</button>
+      </div>
+    </div>`,
+};
 
-// ---------- 成本看板 ----------
-async function statsPage() {
-  const app = $("#app");
-  app.replaceChildren(h("div", { class: "muted" }, "加载中…"));
-  let d;
-  try { d = await api("/api/stats"); } catch (e) { return fail(e); }
-  const t = d.totals;
-  const tile = (label, value, note) => h("div", { class: "tile" }, h("div", { class: "muted small" }, label), h("div", { class: "big" }, value), note ? h("div", { class: "muted small" }, note) : null);
-  const table = (cols, rows) => h("table", { class: "tbl" }, h("thead", {}, h("tr", {}, cols.map(([, label, cls]) => h("th", { class: cls || "" }, label)))),
-    h("tbody", {}, rows.length ? rows.map((r) => h("tr", {}, cols.map(([key, , cls, fmt]) => h("td", { class: cls || "" }, fmt ? fmt(r[key], r) : r[key]))))
-      : h("tr", {}, h("td", { colspan: cols.length, class: "muted" }, "暂无数据"))));
-  const maxMonth = Math.max(1, ...d.by_month.map((m) => m.spent_usd));
-  const KIND = { script: "脚本 DeepSeek", image: "场景图 Seedream", video: "视频 Seedance", tts: "配音 TTS" };
-  const rate = (r) => (r.total ? Math.round((r.done / r.total) * 100) + "%" : "–");
-  app.replaceChildren(...[
-    h("div", { class: "row spread", style: "margin-bottom:12px" }, h("h1", {}, "成本看板"), h("a", { href: "#/" }, "← 返回")),
-    d.priced ? null : h("div", { class: "warnline", style: "margin-bottom:12px" }, "未配置模型单价，以下花费偏低，仅供参考。"),
-    h("div", { class: "tiles" },
-      tile("累计花费", usd(t.spent_usd), `¥${t.spent_cny}`),
-      tile("短片", `${t.projects} 部`, `已完成 ${t.done} 部`),
-      tile("每部成片平均", t.avg_usd_per_done == null ? "–" : usd(t.avg_usd_per_done), `上限 ${usd(d.budget_usd)}`),
-      tile("本月花费", usd(d.month.spent_usd), d.month.team_budget_usd ? `团队月预算 ${usd(d.month.team_budget_usd)}${d.month.warn ? " · 已超 80%" : ""}` : "未设团队月预算"),
-      tile("视频重生成", t.video_shots ? `${Math.round((t.video_regens / t.video_shots) * 100)}%` : "–", `${t.video_regens} 次 / ${t.video_shots} 个镜头`)),
-    h("div", { class: "grid2" },
-      h("div", { class: "panel" }, h("h2", {}, "按月"), d.by_month.length ? d.by_month.map((m) =>
-        h("div", { class: "bar-row" }, h("span", { class: "bar-label" }, m.month),
-          h("span", { class: "bar" }, h("i", { style: `width:${(m.spent_usd / maxMonth) * 100}%` })), h("span", { class: "bar-val" }, usd(m.spent_usd))))
-        : h("div", { class: "muted" }, "暂无数据")),
-      h("div", { class: "panel" }, h("h2", {}, "按模型"), table([["kind", "类别", "", (k) => KIND[k] || k], ["spent_usd", "花费", "r", usd]], d.by_kind))),
-    h("div", { class: "grid2" },
-      h("div", { class: "panel" }, h("h2", {}, "按成员"), table([["user", "成员"], ["projects", "短片", "r"], ["spent_usd", "花费", "r", usd]], d.by_user)),
-      h("div", { class: "panel" }, h("h2", {}, "任务成功率"), table([["label", "任务"], ["total", "次数", "r"], ["done", "成功率", "r", (_v, r) => rate(r)],
-        ["avg_s", "平均耗时", "r", (v) => (v == null ? "–" : v < 90 ? `${v} 秒` : `${(v / 60).toFixed(1)} 分`)]], d.jobs))),
-    h("div", { class: "panel" }, h("h2", {}, "花费最多的短片"), table([["title", "短片", "", (v, r) => h("a", { href: `#/p/${r.id}` }, v)], ["owner", "成员"],
-      ["status", "状态", "", (v) => badge(P_STATUS, v)], ["spent_usd", "花费", "r", usd]], d.top_projects))].filter(Boolean));
-}
+const FinalTab = {
+  props: { p: Object, busy: Boolean },
+  emits: ["job", "update"],
+  setup(props, { emit }) {
+    const meta = computed(() => props.p.final_meta);
+    const hasNarr = computed(() => props.p.shots.some((s) => (s.narration || "").trim()));
+    const allVid = computed(() => props.p.shots.length && props.p.shots.every((s) => s.state.video));
+    const opt = reactive({ tts: store.cfg.tts.enabled && hasNarr.value, voice: store.cfg.tts.voice,
+      burn: meta.value ? !!meta.value.burn_subs : false, fade: meta.value ? !!meta.value.transition : false });
+    const others = computed(() => store.cfg.ratios.filter((r) => r !== props.p.ratio));
+    const bgm = ref(null);
+    const metaText = computed(() => meta.value ? [meta.value.tts ? `旁白配音（${meta.value.voice}）` : "无配音",
+      meta.value.bgm ? "含 BGM" : "无 BGM", meta.value.burn_subs ? "字幕已烧录" : "软字幕",
+      meta.value.transition ? "淡入淡出转场" : "硬切"].join(" · ") : "");
+    const compose = () => emit("job", "compose", { bgm: props.p.has_bgm, tts: opt.tts, voice: opt.voice.trim(),
+      burn_subs: opt.burn, transition: opt.fade ? 0.5 : 0 });
+    async function upload() {
+      const f = bgm.value && bgm.value.files[0];
+      if (!f) return toast("先选择音频文件", true);
+      const fd = new FormData(); fd.set("bgm", f);
+      try { emit("update", await api(`/api/projects/${props.p.id}/bgm`, { method: "POST", form: fd })); toast("BGM 已上传"); }
+      catch (e) { fail(e); }
+    }
+    return { meta, hasNarr, allVid, opt, others, bgm, metaText, compose, upload, cfg: store.cfg };
+  },
+  template: `<div>
+    <div class="panel">
+      <div v-if="meta && p.final" class="muted small" style="text-align:center;margin-bottom:8px">{{ metaText }}</div>
+      <template v-if="p.final">
+        <video class="final" :src="p.final" controls playsinline></video>
+        <div class="row" style="justify-content:center;margin-top:12px">
+          <a :href="p.final" :download="p.title + '.mp4'"><button class="primary">下载成片</button></a>
+          <a :href="p.final.replace(/\\.mp4$/, '.srt')" :download="p.title + '.srt'"><button>下载字幕</button></a></div>
+      </template>
+      <div v-else class="empty">{{ busy ? '处理中…' : allVid ? '所有镜头已就绪，可以合成成片' : '还有镜头没有视频，先到「视频」补齐' }}</div>
+    </div>
+    <div class="grid2">
+      <div class="panel stack"><h2>旁白配音</h2>
+        <div class="muted small">{{ !cfg.tts.enabled ? '服务器未配置 TTS，旁白只作为字幕。' : !hasNarr ? '脚本里没有旁白，可在「脚本」里填写。'
+          : '为每镜旁白配音，按镜头起点对齐；设了说话人的镜头用该角色的音色。' }}</div>
+        <label class="check"><input type="checkbox" v-model="opt.tts" :disabled="!cfg.tts.enabled || !hasNarr || busy">合成时加入旁白配音</label>
+        <div><label>旁白音色（voice_type）</label><input type="text" v-model="opt.voice" :disabled="!cfg.tts.enabled || busy"></div>
+      </div>
+      <div class="panel stack"><h2>剪辑</h2>
+        <label class="check"><input type="checkbox" v-model="opt.burn" :disabled="!hasNarr || busy">把字幕烧进画面（抖音、视频号等平台需要）</label>
+        <label class="check"><input type="checkbox" v-model="opt.fade" :disabled="busy || p.shots.length < 2">镜头之间 0.5 秒淡入淡出</label>
+        <div><label>背景音乐（可选）</label><div class="row"><input type="file" ref="bgm" accept=".mp3,.m4a,.aac,.wav" style="max-width:260px">
+          <button :disabled="busy" @click="upload">上传</button></div>
+          <div class="muted small" style="margin-top:4px">{{ p.has_bgm ? '已上传，合成时混入（有配音时自动压低）' : '未上传' }}</div></div>
+      </div>
+    </div>
+    <div v-if="p.final" class="panel stack"><h2>导出其他画幅</h2>
+      <div class="muted small">不重新生成：原画面完整保留，空白处模糊填充。</div>
+      <div class="row"><template v-for="r in others" :key="r">
+        <a v-if="p.exports && p.exports[r]" :href="p.exports[r]" :download="p.title + '_' + r.replace(':', 'x') + '.mp4'"><button>下载 {{ r }}</button></a>
+        <button v-else :disabled="busy" @click="$emit('job', 'export', { ratio: r })">导出 {{ r }}</button></template></div>
+    </div>
+    <div class="actions"><button class="primary" :disabled="busy || !allVid" @click="compose">{{ p.final ? '重新合成' : '合成成片' }}</button></div>
+  </div>`,
+};
 
-// ---------- 模板库 ----------
-async function templatesPage() {
-  const app = $("#app");
-  app.replaceChildren(h("div", { class: "muted" }, "加载中…"));
-  let list;
-  try { list = await api("/api/templates"); } catch (e) { return fail(e); }
-  const mine = (x) => S.cfg.role === "admin" || !x.owner || x.owner === S.cfg.user;
-  app.replaceChildren(
-    h("div", { class: "row spread", style: "margin-bottom:12px" }, h("h1", {}, "风格模板"), h("a", { href: "#/" }, "← 返回")),
-    h("p", { class: "muted small" }, "模板保存全片风格、固定角色外观、画幅时长和参考素材。在项目「① 脚本」里点“另存为模板”即可创建；同系列短片套用同一模板，角色外观保持一致。"),
-    list.length ? h("div", { class: "plist" }, list.map((x) => h("div", { class: "pcard stack" },
-      h("div", { class: "row spread" }, h("strong", {}, x.name), h("span", { class: "muted small" }, `${x.ratio} · ${x.duration} 秒`)),
-      x.style ? h("div", { class: "small" }, x.style) : null,
-      x.characters.length ? h("div", { class: "muted small" }, x.characters.map((c) => `${c.name}：${c.appearance}`).join("；")) : null,
-      x.assets.length ? h("div", { class: "refs" }, x.assets.map((a) => h("img", { src: a.url, alt: a.name, title: a.name }))) : null,
-      h("div", { class: "row spread" }, h("span", { class: "muted small" }, x.owner || ""),
-        h("div", { class: "row" },
-          mine(x) ? h("button", { class: "ghost danger", onclick: async () => {
-            if (!confirm(`删除模板「${x.name}」？`)) return;
-            try { await api(`/api/templates/${x.id}`, { method: "DELETE" }); templatesPage(); } catch (e) { fail(e); } } }, "删除") : null,
-          h("button", { class: "primary", onclick: () => { S.pendingTemplate = x.id; location.hash = "#/"; } }, "用它新建"))))))
-      : h("div", { class: "panel empty" }, "还没有模板"));
-}
+const ProjectPage = {
+  props: { id: String },
+  components: { Badge, ScriptTab, ImagesTab, VideosTab, FinalTab },
+  setup(props) {
+    const p = ref(null), tab = ref(null), notFound = ref(""), sseOk = ref(false);
+    let es = null, timer = null, pending = null;
+    const busy = computed(() => !!(p.value && (p.value.job || !p.value.can_edit)));
+    const defaultTab = (x) => (["imaging", "image_review", "image_selected"].includes(x.status) ? "images"
+      : ["generating", "shot_review"].includes(x.status) ? "videos" : ["rendering", "done"].includes(x.status) ? "final" : "script");
+    async function refresh() {
+      clearTimeout(timer);
+      try { p.value = await api(`/api/projects/${props.id}`); }
+      catch (e) { notFound.value = e.message; return; }
+      if (!tab.value) tab.value = defaultTab(p.value);
+      if (p.value.job && !sseOk.value) timer = setTimeout(refresh, 2000);
+    }
+    function openEvents() {
+      if (!window.EventSource) return;
+      es = new EventSource(`${BASE}/api/projects/${props.id}/events`);
+      es.onopen = () => (sseOk.value = true);
+      es.onerror = () => (sseOk.value = false);
+      es.addEventListener("update", () => { clearTimeout(pending); pending = setTimeout(refresh, 150); });
+    }
+    onMounted(() => { openEvents(); refresh(); });
+    onBeforeUnmount(() => { if (es) es.close(); clearTimeout(timer); });
+    watch(() => props.id, () => { tab.value = null; p.value = null; if (es) es.close(); openEvents(); refresh(); });
+
+    async function job(kind, extra = {}, toTab) {
+      try {
+        await api(`/api/projects/${p.value.id}/jobs`, { method: "POST", body: { kind, ...extra } });
+        if (toTab) tab.value = toTab;
+        toast("已开始"); await refresh();
+      } catch (e) { fail(e); }
+    }
+    async function cancelJob() {
+      if (!confirm("取消这个任务？已完成的图和视频会保留；正在生成的视频会尝试在方舟侧取消（已开始生成的可能仍会计费）。")) return;
+      try { const r = await api(`/api/jobs/${p.value.job.id}/cancel`, { method: "POST" });
+        toast(r.status === "cancelled" ? "已取消" : "正在停止，当前步骤完成后结束"); await refresh(); } catch (e) { fail(e); }
+    }
+    async function duplicate() {
+      if (!confirm("复制这部短片的需求和脚本（不复制图和视频），用来做变体？")) return;
+      try { const n = await api(`/api/projects/${p.value.id}/duplicate`, { method: "POST" }); toast("已复制"); go(`#/p/${n.id}`); } catch (e) { fail(e); }
+    }
+    async function remove() {
+      if (!confirm(`删除「${p.value.title}」？会移到服务器回收站，管理员可找回。`)) return;
+      try { await api(`/api/projects/${p.value.id}`, { method: "DELETE" }); toast("已删除"); go("#/"); } catch (e) { fail(e); }
+    }
+    const banner = computed(() => p.value && (p.value.job || (p.value.last_job && p.value.last_job.status === "failed" ? p.value.last_job : null)));
+    const logTail = computed(() => banner.value ? (banner.value.log || "").trim().split("\n").slice(-6).join("\n") : "");
+    const tabs = computed(() => {
+      if (!p.value) return [];
+      const sh = p.value.shots, sel = sh.filter((s) => s.state.selected).length, vid = sh.filter((s) => s.state.video).length;
+      return [["script", "① 脚本", sh.length ? sh.length + " 镜" : ""], ["images", "② 场景图", sh.length ? `${sel}/${sh.length}` : ""],
+        ["videos", "③ 视频", sh.length ? `${vid}/${sh.length}` : ""], ["final", "④ 成片", p.value.final ? "✓" : ""]];
+    });
+    const meter = computed(() => {
+      const c = p.value.cost;
+      return { pct: Math.min(100, (c.spent_usd / c.budget_usd) * 100), warnPct: (store.cfg.budget_warn_usd / c.budget_usd) * 100,
+        cls: c.spent_usd >= c.budget_usd ? "over" : c.spent_usd >= store.cfg.budget_warn_usd ? "warn" : "" };
+    });
+    const update = (np) => (p.value = np);
+    return { p, tab, busy, notFound, job, cancelJob, duplicate, remove, banner, logTail, tabs, meter, update, usd, P_STATUS };
+  },
+  template: `<div class="page">
+    <div v-if="notFound" class="panel empty">{{ notFound }}<p><a href="#/">返回列表</a></p></div>
+    <div v-else-if="!p" class="muted">加载中…</div>
+    <template v-else>
+      <div class="page-head">
+        <div class="grow">
+          <div class="crumb"><a href="#/">全部短片</a> / {{ p.title }}</div>
+          <div class="row" style="margin-top:4px"><h1>{{ p.title }}</h1><Badge :map="P_STATUS" :value="p.status" /></div>
+          <div class="muted small" style="margin-top:4px">{{ p.ratio }} · 约 {{ p.brief.duration }} 秒<span v-if="p.owner"> · {{ p.owner }}</span>
+            <span v-if="p.brief.template"> · 模板「{{ p.brief.template.name }}」</span></div>
+        </div>
+        <div class="cost-box">
+          <div class="row spread small"><span>已花 {{ usd(p.cost.spent_usd) }}</span><span class="muted">上限 {{ usd(p.cost.budget_usd) }}</span></div>
+          <div class="meter" :class="meter.cls"><span :style="{ width: meter.pct + '%' }"></span><i :style="{ left: meter.warnPct + '%' }"></i></div>
+          <div v-if="p.estimate" class="muted small" style="margin-top:4px">整片预估 {{ usd(p.estimate.total_usd) }}<span v-if="!p.estimate.priced">（未配置单价）</span></div>
+          <div class="row" style="margin-top:8px;justify-content:flex-end">
+            <button class="ghost small" @click="duplicate">复制</button>
+            <button v-if="p.can_edit" class="ghost small danger" :disabled="!!p.job" @click="remove">删除</button></div>
+        </div>
+      </div>
+      <details class="brief"><summary>需求与参考图</summary><p>{{ p.brief.description }}</p>
+        <p v-if="p.brief.style" class="muted small">风格：{{ p.brief.style }}</p>
+        <div class="refs"><img v-for="u in p.brief.refs" :key="u" :src="u" alt="参考图"></div></details>
+      <div v-if="!p.can_edit" class="banner"><div>只读：这是 {{ p.owner }} 的项目，只有本人或管理员可以修改。可以复制、另存为模板或把场景图存入素材库。</div></div>
+      <div v-if="banner" class="banner" :class="{ bad: banner.status === 'failed' }">
+        <div v-if="banner.status !== 'failed'" class="spin"></div>
+        <div class="grow"><div class="row spread">
+          <strong>{{ banner.status === 'failed' ? banner.label + '失败：' + (banner.error || '') : banner.label + (banner.status === 'queued' ? '（排队中）' : '中…') }}</strong>
+          <button v-if="banner.status !== 'failed' && p.can_edit" class="ghost small danger" @click="cancelJob">取消</button></div>
+          <pre>{{ logTail }}</pre></div>
+      </div>
+      <div class="tabs"><button v-for="t in tabs" :key="t[0]" class="tab" :class="{ on: tab === t[0] }" @click="tab = t[0]">{{ t[1] }}<span v-if="t[2]" class="n">{{ t[2] }}</span></button></div>
+      <ScriptTab v-if="tab === 'script'" :p="p" :busy="busy" @job="job" @saved="update" />
+      <ImagesTab v-else-if="tab === 'images'" :p="p" :busy="busy" @job="job" @update="update" />
+      <VideosTab v-else-if="tab === 'videos'" :p="p" :busy="busy" @job="job" @tab="t => tab = t" />
+      <FinalTab v-else :p="p" :busy="busy" @job="job" @update="update" />
+    </template></div>`,
+};
+
+// ---------- 模板 ----------
+const TemplatesPage = {
+  components: { PageHead },
+  setup() {
+    const list = ref(null);
+    const load = async () => { try { list.value = await api("/api/templates"); } catch (e) { fail(e); list.value = []; } };
+    onMounted(load);
+    const mine = (x) => store.cfg.role === "admin" || !x.owner || x.owner === store.cfg.user;
+    async function del(x) { if (!confirm(`删除模板「${x.name}」？`)) return;
+      try { await api(`/api/templates/${x.id}`, { method: "DELETE" }); load(); } catch (e) { fail(e); } }
+    const use = (x) => { store.pendingTemplate = x.id; go("#/new"); };
+    return { list, mine, del, use };
+  },
+  template: `<div class="page"><PageHead title="风格模板" sub="保存全片风格、固定角色外观与音色、画幅时长和参考素材；同系列短片套用同一模板，角色保持一致" />
+    <div v-if="list === null" class="muted">加载中…</div>
+    <div v-else-if="!list.length" class="panel empty">还没有模板。在短片的「脚本」页点“另存为模板”即可创建。</div>
+    <div v-else class="plist"><div v-for="x in list" :key="x.id" class="pcard stack">
+      <div class="row spread"><strong>{{ x.name }}</strong><span class="muted small">{{ x.ratio }} · {{ x.duration }} 秒</span></div>
+      <div v-if="x.style" class="small">{{ x.style }}</div>
+      <div v-if="x.characters.length" class="muted small">{{ x.characters.map(c => c.name + '：' + c.appearance).join('；') }}</div>
+      <div v-if="x.assets.length" class="refs"><img v-for="a in x.assets" :key="a.id" :src="a.url" :alt="a.name" :title="a.name"></div>
+      <div class="row spread"><span class="muted small">{{ x.owner }}</span><div class="row">
+        <button v-if="mine(x)" class="ghost danger" @click="del(x)">删除</button><button class="primary" @click="use(x)">用它新建</button></div></div>
+    </div></div></div>`,
+};
 
 // ---------- 素材库 ----------
-async function libraryPage() {
-  const app = $("#app");
-  app.replaceChildren(h("div", { class: "muted" }, "加载中…"));
-  let list;
-  try { list = await api("/api/assets"); } catch (e) { return fail(e); }
-  let filter = "全部";
-  const grid = h("div", { class: "lib-grid" });
-  const chips = h("div", { class: "chips" });
-  const mine = (x) => S.cfg.role === "admin" || !x.owner || x.owner === S.cfg.user;
-  const draw = () => {
-    chips.replaceChildren(...["全部", ...S.cfg.asset_kinds].map((k) => h("button", { class: "chip" + (k === filter ? " on" : ""), onclick: () => { filter = k; draw(); } }, k)));
-    const items = list.filter((x) => filter === "全部" || x.kind === filter);
-    grid.replaceChildren(...(items.length ? items.map((x) => h("div", { class: "lib-item" },
-      h("img", { src: x.url, alt: x.name, loading: "lazy" }),
-      h("div", { class: "row spread", style: "padding:8px 10px" },
-        h("div", {}, h("div", { class: "small" }, x.name), h("div", { class: "muted small" }, `${x.kind} · ${x.owner || ""}`)),
-        mine(x) ? h("button", { class: "ghost danger", onclick: async () => {
-          if (!confirm(`删除素材「${x.name}」？已用它的项目不受影响。`)) return;
-          try { await api(`/api/assets/${x.id}`, { method: "DELETE" }); libraryPage(); } catch (e) { fail(e); } } }, "删除") : null)))
-      : [h("div", { class: "muted" }, "暂无素材")]));
-  };
-  const name = h("input", { type: "text", placeholder: "例如：店主小林正面" });
-  const kind = h("select", {}, S.cfg.asset_kinds.map((k) => h("option", { value: k }, k)));
-  const file = h("input", { type: "file", accept: "image/png,image/jpeg,image/webp" });
-  const upload = async (ev) => {
-    ev.preventDefault();
-    if (!file.files.length) return toast("请选择图片", true);
-    const fd = new FormData(); fd.set("name", name.value.trim()); fd.set("kind", kind.value); fd.set("file", file.files[0]);
-    try { await api("/api/assets", { method: "POST", form: fd }); toast("已上传"); libraryPage(); } catch (e) { fail(e); }
-  };
-  draw();
-  app.replaceChildren(
-    h("div", { class: "row spread", style: "margin-bottom:12px" }, h("h1", {}, "素材库"), h("a", { href: "#/" }, "← 返回")),
-    h("form", { class: "panel", onsubmit: upload },
-      h("h2", {}, "上传素材"),
-      h("div", { class: "grid3" }, h("div", {}, h("label", {}, "名称"), name), h("div", {}, h("label", {}, "类型"), kind),
-        h("div", {}, h("label", {}, "图片"), file)),
-      h("div", { class: "row spread", style: "margin-top:12px" },
-        h("span", { class: "muted small" }, "角色、产品图会作为参考图传给 Seedream，新建短片时可直接选用。"),
-        h("button", { class: "primary", type: "submit" }, "上传"))),
-    chips, h("div", { style: "height:12px" }), grid);
-}
+const LibraryPage = {
+  components: { Chips, PageHead },
+  setup() {
+    const list = ref(null), filter = ref("全部"), form = reactive({ name: "", kind: store.cfg.asset_kinds[0] }), file = ref(null);
+    const load = async () => { try { list.value = await api("/api/assets"); } catch (e) { fail(e); list.value = []; } };
+    onMounted(load);
+    const shown = computed(() => (list.value || []).filter((x) => filter.value === "全部" || x.kind === filter.value));
+    const mine = (x) => store.cfg.role === "admin" || !x.owner || x.owner === store.cfg.user;
+    async function upload() {
+      const f = file.value && file.value.files[0];
+      if (!f) return toast("请选择图片", true);
+      const fd = new FormData(); fd.set("name", form.name.trim()); fd.set("kind", form.kind); fd.set("file", f);
+      try { await api("/api/assets", { method: "POST", form: fd }); toast("已上传"); form.name = ""; file.value.value = ""; load(); } catch (e) { fail(e); }
+    }
+    async function del(x) { if (!confirm(`删除素材「${x.name}」？已用它的短片不受影响。`)) return;
+      try { await api(`/api/assets/${x.id}`, { method: "DELETE" }); load(); } catch (e) { fail(e); } }
+    return { list, filter, form, file, shown, mine, upload, del, kinds: ["全部", ...store.cfg.asset_kinds], cfg: store.cfg };
+  },
+  template: `<div class="page"><PageHead title="素材库" sub="团队共享的角色、产品、场景、风格图，新建短片时可直接选作参考图" />
+    <div class="panel"><h2>上传素材</h2>
+      <div class="grid3"><div><label>名称</label><input type="text" v-model="form.name" placeholder="例如：店主小林正面"></div>
+        <div><label>类型</label><select v-model="form.kind"><option v-for="k in cfg.asset_kinds" :key="k">{{ k }}</option></select></div>
+        <div><label>图片</label><input type="file" ref="file" accept="image/png,image/jpeg,image/webp"></div></div>
+      <div class="row" style="justify-content:flex-end;margin-top:12px"><button class="primary" @click="upload">上传</button></div></div>
+    <div class="toolbar"><Chips :options="kinds" v-model="filter" /></div>
+    <div v-if="list === null" class="muted">加载中…</div>
+    <div v-else-if="!shown.length" class="muted">暂无素材</div>
+    <div v-else class="lib-grid"><div v-for="x in shown" :key="x.id" class="lib-item"><img :src="x.url" :alt="x.name" loading="lazy">
+      <div class="row spread" style="padding:8px 10px"><div><div class="small">{{ x.name }}</div><div class="muted small">{{ x.kind }} · {{ x.owner }}</div></div>
+        <button v-if="mine(x)" class="ghost danger" @click="del(x)">删除</button></div></div></div></div>`,
+};
+
+// ---------- 成本看板 ----------
+const StatsPage = {
+  components: { PageHead, DataTable, Badge },
+  setup() {
+    const d = ref(null);
+    onMounted(async () => { try { d.value = await api("/api/stats"); } catch (e) { fail(e); } });
+    const KIND = { script: "脚本 DeepSeek", image: "场景图 Seedream", video: "视频 Seedance", tts: "配音 TTS" };
+    const maxMonth = computed(() => Math.max(1, ...(d.value ? d.value.by_month.map((m) => m.spent_usd) : [1])));
+    const rate = (r) => (r.total ? Math.round((r.done / r.total) * 100) + "%" : "–");
+    const dur = (v) => (v == null ? "–" : v < 90 ? `${v} 秒` : `${(v / 60).toFixed(1)} 分`);
+    return { d, KIND, maxMonth, rate, dur, usd, P_STATUS };
+  },
+  template: `<div class="page"><PageHead title="成本看板" />
+    <div v-if="!d" class="muted">加载中…</div>
+    <template v-else>
+      <div v-if="!d.priced" class="warnline" style="margin-bottom:12px">未配置模型单价，以下花费偏低，仅供参考。</div>
+      <div class="tiles">
+        <div class="tile"><div class="muted small">累计花费</div><div class="big">{{ usd(d.totals.spent_usd) }}</div><div class="muted small">¥{{ d.totals.spent_cny }}</div></div>
+        <div class="tile"><div class="muted small">本月花费</div><div class="big">{{ usd(d.month.spent_usd) }}</div>
+          <div class="muted small">{{ d.month.team_budget_usd ? '团队月预算 ' + usd(d.month.team_budget_usd) + (d.month.warn ? ' · 已超 80%' : '') : '未设团队月预算' }}</div></div>
+        <div class="tile"><div class="muted small">短片</div><div class="big">{{ d.totals.projects }} 部</div><div class="muted small">已完成 {{ d.totals.done }} 部</div></div>
+        <div class="tile"><div class="muted small">每部成片平均</div><div class="big">{{ d.totals.avg_usd_per_done == null ? '–' : usd(d.totals.avg_usd_per_done) }}</div><div class="muted small">上限 {{ usd(d.budget_usd) }}</div></div>
+        <div class="tile"><div class="muted small">视频重生成</div><div class="big">{{ d.totals.video_shots ? Math.round(d.totals.video_regens / d.totals.video_shots * 100) + '%' : '–' }}</div>
+          <div class="muted small">{{ d.totals.video_regens }} 次 / {{ d.totals.video_shots }} 个镜头</div></div>
+      </div>
+      <div class="grid2">
+        <div class="panel"><h2>按月</h2><div v-if="!d.by_month.length" class="muted">暂无数据</div>
+          <div v-for="m in d.by_month" :key="m.month" class="bar-row"><span>{{ m.month }}</span><span class="bar"><i :style="{ width: m.spent_usd / maxMonth * 100 + '%' }"></i></span><span class="bar-val">{{ usd(m.spent_usd) }}</span></div></div>
+        <div class="panel"><h2>按模型</h2><DataTable :cols="[{ key: 'kind', label: '类别', fmt: k => KIND[k] || k }, { key: 'spent_usd', label: '花费', cls: 'r', fmt: usd }]" :rows="d.by_kind" /></div>
+      </div>
+      <div class="grid2">
+        <div class="panel"><h2>按成员</h2><DataTable :cols="[{ key: 'user', label: '成员' }, { key: 'projects', label: '短片', cls: 'r' }, { key: 'spent_usd', label: '花费', cls: 'r', fmt: usd }]" :rows="d.by_user" /></div>
+        <div class="panel"><h2>任务成功率</h2><DataTable :cols="[{ key: 'label', label: '任务' }, { key: 'total', label: '次数', cls: 'r' }, { key: 'done', label: '成功率', cls: 'r', fmt: (v, r) => rate(r) }, { key: 'avg_s', label: '平均耗时', cls: 'r', fmt: dur }]" :rows="d.jobs" /></div>
+      </div>
+      <div class="panel"><h2>花费最多的短片</h2>
+        <DataTable :cols="[{ key: 'title', label: '短片' }, { key: 'owner', label: '成员' }, { key: 'status', label: '状态' }, { key: 'spent_usd', label: '花费', cls: 'r', fmt: usd }]" :rows="d.top_projects">
+          <template #title="{ row }"><a :href="'#/p/' + row.id">{{ row.title }}</a></template>
+          <template #status="{ row }"><Badge :map="P_STATUS" :value="row.status" /></template></DataTable></div>
+    </template></div>`,
+};
 
 // ---------- 成员 ----------
-async function membersPage() {
-  const app = $("#app");
-  const pw = h("input", { type: "password", placeholder: "至少 8 位", autocomplete: "new-password" });
-  const myPw = h("form", { class: "panel stack", onsubmit: async (ev) => {
-      ev.preventDefault();
-      try { await api(`/api/users/${encodeURIComponent(S.cfg.user)}`, { method: "PATCH", body: { password: pw.value } }); toast("密码已修改，浏览器会要求重新登录"); pw.value = ""; }
-      catch (e) { fail(e); } } },
-    h("h2", {}, "修改我的密码"), h("div", { class: "row" }, h("div", { class: "grow" }, pw), h("button", { class: "primary", type: "submit" }, "保存")));
-  const head = h("div", { class: "row spread", style: "margin-bottom:12px" }, h("h1", {}, S.cfg.role === "admin" ? "成员管理" : "我的账号"), h("a", { href: "#/" }, "← 返回"));
-  if (!S.cfg.accounts) {
-    return app.replaceChildren(head, h("div", { class: "panel stack" },
-      h("p", {}, "当前使用共用口令登录（APP_PASSWORD），所有人都是管理员。"),
-      h("p", { class: "muted small" }, "要启用成员账号：在 .env 设置 ADMIN_USER 和 ADMIN_PASSWORD 后重启服务，用该账号登录后在这里添加成员。启用后共用口令失效。")),
-      S.cfg.role === "admin" ? h("div", { class: "panel stack", id: "syspanel" }, h("h2", {}, "系统自检")) : null);
-    if (S.cfg.role === "admin") loadSystem(false);
-    return;
-  }
-  if (S.cfg.role !== "admin") return app.replaceChildren(head, myPw);
-  let users;
-  try { users = await api("/api/users"); } catch (e) { return fail(e); }
-  const patch = async (name, body, msg) => {
-    try { await api(`/api/users/${encodeURIComponent(name)}`, { method: "PATCH", body }); toast(msg); membersPage(); } catch (e) { fail(e); }
-  };
-  const nName = h("input", { type: "text", placeholder: "用户名（建议用真名）" });
-  const nPw = h("input", { type: "password", placeholder: "初始密码，至少 8 位", autocomplete: "new-password" });
-  const nRole = h("select", {}, h("option", { value: "member" }, "成员"), h("option", { value: "admin" }, "管理员"));
-  app.replaceChildren(head,
-    h("div", { class: "panel" }, h("table", { class: "tbl" },
-      h("thead", {}, h("tr", {}, h("th", {}, "成员"), h("th", {}, "角色"), h("th", {}, "状态"), h("th", { class: "r" }, "操作"))),
-      h("tbody", {}, users.map((u) => h("tr", {},
-        h("td", {}, u.name, u.name === S.cfg.user ? h("span", { class: "muted small" }, "（我）") : null),
-        h("td", {}, u.role === "admin" ? "管理员" : "成员"),
-        h("td", {}, u.disabled ? h("span", { class: "badge bad" }, "已停用") : h("span", { class: "badge ok" }, "正常")),
-        h("td", { class: "r" },
-          h("button", { class: "ghost", onclick: () => { const v = prompt(`为 ${u.name} 设置新密码（至少 8 位）`); if (v) patch(u.name, { password: v }, "密码已重置"); } }, "重置密码"),
-          h("button", { class: "ghost", onclick: () => patch(u.name, { role: u.role === "admin" ? "member" : "admin" }, "角色已修改") }, u.role === "admin" ? "设为成员" : "设为管理员"),
-          u.name === S.cfg.user ? null : h("button", { class: "ghost danger", onclick: () => patch(u.name, { disabled: !u.disabled }, u.disabled ? "已启用" : "已停用") }, u.disabled ? "启用" : "停用"))))))),
-    h("form", { class: "panel stack", onsubmit: async (ev) => {
-        ev.preventDefault();
-        try { await api("/api/users", { method: "POST", body: { name: nName.value.trim(), password: nPw.value, role: nRole.value } }); toast("已添加"); membersPage(); }
-        catch (e) { fail(e); } } },
-      h("h2", {}, "添加成员"),
-      h("div", { class: "grid3" }, nName, nPw, nRole),
-      h("div", { class: "row spread" }, h("span", { class: "muted small" }, "成员可以看所有短片，只能修改自己创建的；管理员可以修改全部并管理成员。"),
-        h("button", { class: "primary", type: "submit" }, "添加"))),
-    myPw,
-    h("div", { class: "panel stack", id: "syspanel" }, h("h2", {}, "系统自检"), h("div", { class: "muted small" }, "加载中…")));
-  loadSystem(false);
-}
+const MembersPage = {
+  components: { PageHead },
+  setup() {
+    const cfg = store.cfg, users = ref(null), sso = ref(null), pw = ref(""), nu = reactive({ name: "", password: "", role: "member" });
+    const load = async () => {
+      try {
+        if (cfg.auth === "oidc" && cfg.role === "admin") sso.value = await api("/api/sso-users");
+        else if (cfg.auth === "accounts" && cfg.role === "admin") users.value = await api("/api/users");
+      } catch (e) { fail(e); }
+    };
+    onMounted(load);
+    const patch = async (name, body, msg) => { try { await api(`/api/users/${encodeURIComponent(name)}`, { method: "PATCH", body }); toast(msg); load(); } catch (e) { fail(e); } };
+    const setRole = async (u, role) => { try { await api(`/api/sso-users/${encodeURIComponent(u.sub)}`, { method: "PATCH", body: { role } }); toast("角色已修改"); load(); } catch (e) { fail(e); } };
+    const resetPw = (u) => { const v = prompt(`为 ${u.name} 设置新密码（至少 8 位）`); if (v) patch(u.name, { password: v }, "密码已重置"); };
+    async function addUser() { try { await api("/api/users", { method: "POST", body: { ...nu, name: nu.name.trim() } }); toast("已添加"); nu.name = nu.password = ""; load(); } catch (e) { fail(e); } }
+    async function myPw() { try { await api(`/api/users/${encodeURIComponent(cfg.user)}`, { method: "PATCH", body: { password: pw.value } }); toast("密码已修改，浏览器会要求重新登录"); pw.value = ""; } catch (e) { fail(e); } }
+    const fmt = (t) => new Date(t * 1000).toLocaleString("zh-CN", { hour12: false }).slice(0, 16);
+    return { cfg, users, sso, pw, nu, setRole, resetPw, patch, addUser, myPw, fmt };
+  },
+  template: `<div class="page"><PageHead :title="cfg.role === 'admin' ? '成员' : '我的账号'" />
+    <div v-if="cfg.auth === 'oidc'" class="panel stack">
+      <div>使用 ainewimage.com 全局账号登录。成员第一次打开本系统后会出现在下面的名单里。</div>
+      <div class="muted small">.env 里 <code>OIDC_ADMINS</code> 列出的人固定为管理员；其他人默认是成员，管理员可在这里调整。成员能看所有短片，只能修改自己创建的。</div>
+      <table v-if="sso" class="tbl"><thead><tr><th>成员</th><th>邮箱</th><th>最近登录</th><th>角色</th><th class="r">操作</th></tr></thead><tbody>
+        <tr v-for="u in sso" :key="u.sub"><td>{{ u.name }}<span v-if="u.name === cfg.user" class="muted small">（我）</span></td><td class="muted small">{{ u.email }}</td>
+          <td class="muted small">{{ fmt(u.last_seen) }}</td><td>{{ u.role === 'admin' ? '管理员' : '成员' }}<span v-if="u.fixed_admin" class="muted small">（固定）</span></td>
+          <td class="r"><button v-if="!u.fixed_admin" class="ghost" @click="setRole(u, u.role === 'admin' ? 'member' : 'admin')">{{ u.role === 'admin' ? '设为成员' : '设为管理员' }}</button></td></tr>
+      </tbody></table>
+    </div>
+    <div v-else-if="cfg.auth !== 'accounts'" class="panel stack">
+      <p>当前{{ cfg.auth === 'password' ? '使用共用口令登录，所有人都是管理员' : '没有启用登录' }}。</p>
+      <p class="muted small">正式使用建议改为全局账号登录：.env 设置 AUTH_MODE=oidc 及身份中心参数后重启。</p></div>
+    <template v-else>
+      <div v-if="cfg.role === 'admin' && users" class="panel"><table class="tbl"><thead><tr><th>成员</th><th>角色</th><th>状态</th><th class="r">操作</th></tr></thead><tbody>
+        <tr v-for="u in users" :key="u.name"><td>{{ u.name }}<span v-if="u.name === cfg.user" class="muted small">（我）</span></td>
+          <td>{{ u.role === 'admin' ? '管理员' : '成员' }}</td><td><span class="badge" :class="u.disabled ? 'bad' : 'ok'">{{ u.disabled ? '已停用' : '正常' }}</span></td>
+          <td class="r"><button class="ghost" @click="resetPw(u)">重置密码</button>
+            <button class="ghost" @click="patch(u.name, { role: u.role === 'admin' ? 'member' : 'admin' }, '角色已修改')">{{ u.role === 'admin' ? '设为成员' : '设为管理员' }}</button>
+            <button v-if="u.name !== cfg.user" class="ghost danger" @click="patch(u.name, { disabled: !u.disabled }, u.disabled ? '已启用' : '已停用')">{{ u.disabled ? '启用' : '停用' }}</button></td></tr>
+      </tbody></table></div>
+      <div v-if="cfg.role === 'admin'" class="panel stack"><h2>添加成员</h2>
+        <div class="grid3"><input type="text" v-model="nu.name" placeholder="用户名"><input type="password" v-model="nu.password" placeholder="初始密码，至少 8 位">
+          <select v-model="nu.role"><option value="member">成员</option><option value="admin">管理员</option></select></div>
+        <div class="row" style="justify-content:flex-end"><button class="primary" @click="addUser">添加</button></div></div>
+      <div class="panel stack"><h2>修改我的密码</h2><div class="row"><div class="grow"><input type="password" v-model="pw" placeholder="至少 8 位"></div>
+        <button class="primary" @click="myPw">保存</button></div></div>
+    </template></div>`,
+};
 
-async function loadSystem(ping) {
-  const box = $("#syspanel");
-  if (!box) return;
-  let d;
-  try { d = await api("/api/system" + (ping ? "?ping=1" : "")); } catch (e) { return fail(e); }
-  const mark = { ok: ["✓", "ok"], warn: ["!", "todo"], fail: ["✗", "bad"] };
-  box.replaceChildren(
-    h("div", { class: "row spread" }, h("h2", {}, "系统自检"),
-      h("button", { onclick: (ev) => { ev.target.disabled = true; ev.target.textContent = "测试中…"; loadSystem(true); } }, "测试接口连通")),
-    h("table", { class: "tbl" }, h("tbody", {}, d.items.map((it) => h("tr", {},
-      h("td", { style: "width:36px" }, h("span", { class: "badge " + mark[it.level][1] }, mark[it.level][0])),
-      h("td", { style: "width:120px" }, it.name), h("td", { class: "small" }, it.detail))))),
-    h("div", { class: "muted small" }, `回收站里有 ${d.trash} 个已删除项目（data/trash）。后台任务线程 ${d.workers} 个。`, ping ? "" : " 连通测试只读取模型/任务列表，不产生生成费用。"));
-}
+// ---------- 系统 ----------
+const SystemPage = {
+  components: { PageHead },
+  setup() {
+    const d = ref(null), pinging = ref(false);
+    const load = async (ping) => { pinging.value = ping; try { d.value = await api("/api/system" + (ping ? "?ping=1" : "")); } catch (e) { fail(e); } pinging.value = false; };
+    onMounted(() => load(false));
+    const mark = { ok: ["✓", "ok"], warn: ["!", "todo"], fail: ["✗", "bad"] };
+    return { d, pinging, load, mark };
+  },
+  template: `<div class="page"><PageHead title="系统自检" sub="检查 FFmpeg、Key、单价、模型与磁盘；连通测试只读取列表接口，不产生生成费用">
+      <button :disabled="pinging" @click="load(true)">{{ pinging ? '测试中…' : '测试接口连通' }}</button></PageHead>
+    <div v-if="!d" class="muted">加载中…</div>
+    <div v-else class="panel"><table class="tbl"><tbody><tr v-for="it in d.items" :key="it.name">
+      <td style="width:40px"><span class="badge" :class="mark[it.level][1]">{{ mark[it.level][0] }}</span></td>
+      <td style="width:130px">{{ it.name }}</td><td class="small">{{ it.detail }}</td></tr></tbody></table>
+      <div class="muted small" style="margin-top:10px">回收站里有 {{ d.trash }} 个已删除项目（data/trash）。后台任务线程 {{ d.workers }} 个。</div></div></div>`,
+};
 
-function drawDemoBar() {
-  if (!S.cfg.demo || $("#demobar")) return;
-  document.body.insertBefore(h("div", { id: "demobar", class: "demobar" },
-    "演示模式：不调用真实接口、不花钱，图片和视频都是占位素材。正式使用前请关闭 DEMO_MODE。"), $("main"));
-}
+// ---------- 外壳：左侧菜单 + 右侧页面 ----------
+const PAGES = { list: ListPage, new: NewPage, project: ProjectPage, templates: TemplatesPage, library: LibraryPage,
+  stats: StatsPage, members: MembersPage, system: SystemPage };
 
-function drawNav() {
-  drawDemoBar();
-  const links = [["#/templates", "模板"], ["#/library", "素材库"], ["#/stats", "成本看板"]];
-  if (S.cfg.accounts || S.cfg.role === "admin") links.push(["#/members", S.cfg.role === "admin" ? "成员" : "账号"]);
-  $("#nav").replaceChildren(...links.map(([href, t]) => h("a", { href }, t)), ...(S.cfg.user ? [h("span", { class: "who" }, S.cfg.user)] : []));
-}
+const App = {
+  setup() {
+    const menu = computed(() => {
+      const c = store.cfg, admin = c.role === "admin";
+      return [
+        { group: "创作", items: [["new", "#/new", "新建短片", "＋"], ["list", "#/", "全部短片", "▤"]] },
+        { group: "资产", items: [["templates", "#/templates", "风格模板", "◇"], ["library", "#/library", "素材库", "▦"]] },
+        { group: "管理", items: [["stats", "#/stats", "成本看板", "▥"],
+          ...(c.auth !== "open" || admin ? [["members", "#/members", admin ? "成员" : "我的账号", "◎"]] : []),
+          ...(admin ? [["system", "#/system", "系统自检", "⚙"]] : [])] },
+      ];
+    });
+    const active = (name) => store.route.name === name || (name === "list" && store.route.name === "project");
+    const page = computed(() => PAGES[store.route.name] || ListPage);
+    const pageKey = computed(() => store.route.name + (store.route.params.id || ""));
+    return { store, menu, active, page, pageKey, go };
+  },
+  template: `<div class="layout" :class="{ 'menu-open': store.menuOpen }">
+    <aside class="sidebar">
+      <div class="brand"><span class="logo">▶</span>AI 短片工作台</div>
+      <nav class="menu"><div v-for="g in menu" :key="g.group" class="menu-group"><div class="menu-title">{{ g.group }}</div>
+        <a v-for="m in g.items" :key="m[0]" :href="m[1]" class="menu-item" :class="{ active: active(m[0]) }" @click="store.menuOpen = false">
+          <span class="ico">{{ m[3] }}</span>{{ m[2] }}</a></div></nav>
+      <div class="side-foot" v-if="store.cfg.user || store.cfg.logout">
+        <div class="who"><span class="avatar">{{ (store.cfg.user || '?').slice(0, 1) }}</span>
+          <div><div>{{ store.cfg.user || '未登录' }}</div><div class="muted small">{{ store.cfg.role === 'admin' ? '管理员' : '成员' }}</div></div></div>
+        <a v-if="store.cfg.logout" class="logout" :href="store.cfg.logout">退出</a>
+      </div>
+    </aside>
+    <div class="scrim" @click="store.menuOpen = false"></div>
+    <main class="content">
+      <div class="topbar-m"><button class="ghost burger" @click="store.menuOpen = !store.menuOpen" aria-label="菜单">☰</button><span>AI 短片工作台</span></div>
+      <div v-if="store.cfg.demo" class="demobar">演示模式：不调用真实接口、不花钱，图片和视频都是占位素材。正式使用前请关闭 DEMO_MODE。</div>
+      <component :is="page" :key="pageKey" v-bind="store.route.params" />
+    </main>
+    <div v-if="store.toast" class="toast" :class="{ bad: store.toast.bad }">{{ store.toast.msg }}</div>
+  </div>`,
+};
 
-// ---------- 启动 ----------
 (async function boot() {
   try {
-    S.cfg = await api("/api/config");
-    drawNav();
-    route();
-  } catch (e) { $("#app").replaceChildren(h("div", { class: "empty" }, "无法连接服务：" + e.message)); }
+    store.cfg = await api("/api/config");
+    store.route = parseRoute();
+    createApp(App).mount("#app");
+  } catch (e) {
+    document.getElementById("app").textContent = "无法连接服务：" + e.message;
+  }
 })();

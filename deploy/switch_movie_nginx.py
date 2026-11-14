@@ -7,6 +7,7 @@
 - 修改前把原文件备份到 /etc/nginx/backup/（不在 sites-enabled 里，不会被 nginx 加载）
 - 删除所有 `location ... /movie...` 块（不动 `location = /_portal_gate_movie` 门户登录检查）
 - 原 /movie/ 块里的 auth_request / auth_request_set / error_page 原样带到新配置，门户登录继续生效
+- 加 --no-gate：不沿用门户 auth_request（应用自己走全局账号 OIDC 登录时用）
 - nginx -t 不通过则自动还原；通过则 reload
 """
 from __future__ import annotations
@@ -34,7 +35,7 @@ def block_end(lines: list[str], start: int) -> int:
     raise ValueError(f"第 {start + 1} 行开始的 location 块没有闭合")
 
 
-def rewrite(text: str, port: int) -> tuple[str, int, list[str]]:
+def rewrite(text: str, port: int, keep_gate: bool = True) -> tuple[str, int, list[str]]:
     lines = text.split("\n")
     out: list[str] = []
     removed = 0
@@ -62,6 +63,8 @@ def rewrite(text: str, port: int) -> tuple[str, int, list[str]]:
     if insert_at is None:
         raise ValueError("没找到 /movie 的 location，文件可能已经改过")
     ind = indent
+    if not keep_gate:  # 应用自己做 OIDC 登录，不再套门户 auth_request
+        auth = []
     new = [
         f"{ind}# ==== aimovie（AI 短片工作台，反代 127.0.0.1:{port}）====",
         f"{ind}location = /movie {{ return 301 /movie/; }}",
@@ -82,10 +85,12 @@ def rewrite(text: str, port: int) -> tuple[str, int, list[str]]:
 
 
 def main() -> int:
-    conf = Path(sys.argv[1] if len(sys.argv) > 1 else "/etc/nginx/sites-enabled/ainewimage")
-    port = int(sys.argv[2]) if len(sys.argv) > 2 else 8010
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    keep_gate = "--no-gate" not in sys.argv  # --no-gate：去掉门户 auth_request，改由应用 OIDC 登录
+    conf = Path(args[0] if args else "/etc/nginx/sites-enabled/ainewimage")
+    port = int(args[1]) if len(args) > 1 else 8010
     original = conf.read_text(encoding="utf-8")
-    new, removed, auth = rewrite(original, port)
+    new, removed, auth = rewrite(original, port, keep_gate)
     backup_dir = Path("/etc/nginx/backup")
     backup_dir.mkdir(parents=True, exist_ok=True)
     backup = backup_dir / f"{conf.name}.before-aimovie.{time.strftime('%Y%m%d_%H%M%S')}"

@@ -12,6 +12,8 @@ import json
 import os
 import re
 import secrets
+
+import requests
 import shutil
 import tempfile
 import time
@@ -34,6 +36,7 @@ from videogen.pipeline import Pipeline, Project, StageError
 from videogen.script import ScriptError
 
 from .jobs import JobStore, ProjectBusy, Runner, default_factory
+from .oidc import OIDC, SESSION_COOKIE, STATE_COOKIE, OIDCConfig, OIDCError
 from .team import ASSET_KINDS, TeamError, TeamStore
 
 STATIC = Path(__file__).parent / "static"
@@ -87,10 +90,12 @@ class Auth(BaseHTTPMiddleware):
     3. 都没设置 → 不登录（本地开发）
     """
 
-    def __init__(self, app, team, password: str):
+    def __init__(self, app, team, password: str, oidc=None, base: str = ""):
         super().__init__(app)
         self.team = team
         self.password = password
+        self.oidc = oidc
+        self.base = base
 
     async def dispatch(self, request: Request, call_next):
         if request.method not in SAFE_METHODS and is_cross_site(request):
@@ -104,6 +109,8 @@ class Auth(BaseHTTPMiddleware):
     async def _dispatch(self, request: Request, call_next):
         if request.url.path.endswith("/healthz"):  # 健康检查不需要登录
             return await call_next(request)
+        if self.oidc:
+            return await self._oidc(request, call_next)
         has_users = await run_in_threadpool(self.team.has_users)
         if not has_users and not self.password:
             request.state.user, request.state.role = "", "admin"
@@ -127,11 +134,28 @@ class Auth(BaseHTTPMiddleware):
         request.state.user, request.state.role = user, role
         return await call_next(request)
 
+    async def _oidc(self, request: Request, call_next):
+        path = request.url.path[len(self.base):] if request.url.path.startswith(self.base) else request.url.path
+        if path.startswith("/auth/") or path.startswith("/static/"):
+            return await call_next(request)
+        sess = self.oidc.read_session(request.cookies.get(SESSION_COOKIE))
+        if not sess:
+            login = f"{self.base}/auth/login"
+            if path.startswith(("/api/", "/files/", "/library/")):
+                return JSONResponse({"error": "登录已过期，请重新登录", "login": login}, status_code=401)
+            from urllib.parse import quote
+            return RedirectResponse(f"{login}?next={quote(path or '/')}", status_code=302)
+        role = "admin" if sess["sub"] in self.oidc.cfg.admins or sess["name"] in self.oidc.cfg.admins \
+            else await run_in_threadpool(self.team.sso_role, sess["sub"])
+        request.state.user, request.state.role, request.state.sub = sess["name"], role, sess["sub"]
+        return await call_next(request)
+
 
 def create_app(settings: Settings | None = None, data_dir: Path | None = None,
                factory=default_factory, workers: int | None = None,
                password: str | None = None, team_budget_usd: float | None = None,
-               base_path: str | None = None) -> Starlette:
+               base_path: str | None = None, oidc_config: OIDCConfig | None = None,
+               oidc_session=None) -> Starlette:
     s = settings or Settings.from_env()
     data = Path(data_dir or os.environ.get("DATA_DIR", "data"))
     runs = data / "runs"
@@ -142,6 +166,8 @@ def create_app(settings: Settings | None = None, data_dir: Path | None = None,
     password = password if password is not None else os.environ.get("APP_PASSWORD", "")
     team = TeamStore(data / "app.db", data / "library")
     base = normalize_base(base_path if base_path is not None else os.environ.get("BASE_PATH", ""))
+    oidc_cfg = oidc_config if oidc_config is not None else OIDCConfig.from_env()
+    oidc = OIDC(oidc_cfg, base, session=oidc_session) if oidc_cfg else None
     team_budget = float(os.environ.get("TEAM_MONTHLY_BUDGET_USD", 0) or 0) if team_budget_usd is None else team_budget_usd
 
     # ---------- 工具 ----------
@@ -256,14 +282,18 @@ def create_app(settings: Settings | None = None, data_dir: Path | None = None,
     index_html = (STATIC / "index.html").read_text(encoding="utf-8")
     ver = asset_version()
     index_html = index_html.replace("static/style.css", f"static/style.css?{ver}").replace(
-        "static/app.js", f"static/app.js?{ver}")
+        "static/app.js", f"static/app.js?{ver}").replace(
+        "static/vendor/vue.global.prod.js", f"static/vendor/vue.global.prod.js?{ver}")
 
     async def index(_req):
         return Response(index_html, media_type="text/html; charset=utf-8", headers={"Cache-Control": "no-cache"})
 
     async def config(req):
         return JSONResponse({
-            "user": user_of(req), "role": getattr(req.state, "role", ""), "accounts": team.has_users(),
+            "user": user_of(req), "role": getattr(req.state, "role", ""),
+            "auth": "oidc" if oidc else ("accounts" if team.has_users() else ("password" if password else "open")),
+            "logout": f"{base}/auth/logout" if oidc else None,
+            "accounts": bool(oidc) or team.has_users(),
             "asset_kinds": ASSET_KINDS, "team_budget_usd": team_budget, "budget_usd": s.budget_usd, "budget_warn_usd": s.budget_warn_usd,
             "ratios": list(RATIO_SIZES), "durations": s.seedance_durations,
             "candidates_per_shot": s.candidates_per_shot, "priced": s.pricing.configured,
@@ -575,6 +605,72 @@ def create_app(settings: Settings | None = None, data_dir: Path | None = None,
         shutil.move(str(p.root), str(trash / f"{pid}__{time.strftime('%Y%m%d%H%M%S')}__{user_of(req) or 'anon'}"))
         return JSONResponse({"ok": True, "trash": True})
 
+    # ---------- 全局账号登录（OIDC） ----------
+    def cookie_opts(req: Request) -> dict:
+        secure = req.headers.get("x-forwarded-proto", req.url.scheme) == "https"
+        return {"httponly": True, "samesite": "lax", "secure": secure, "path": f"{base}/"}
+
+    async def auth_login(req: Request):
+        nxt = req.query_params.get("next") or "/"
+        if not nxt.startswith("/") or nxt.startswith("//"):
+            nxt = "/"
+        try:
+            state, nonce, cookie = oidc.new_state(nxt)
+            url = await run_in_threadpool(oidc.authorize_url, state, nonce)
+        except (OIDCError, requests.RequestException) as e:
+            return Response(f"无法连接身份中心：{e}", status_code=502, media_type="text/plain; charset=utf-8")
+        resp = RedirectResponse(url, status_code=302)
+        resp.set_cookie(STATE_COOKIE, cookie, max_age=600, **cookie_opts(req))
+        return resp
+
+    async def auth_callback(req: Request):
+        st = oidc.read_state(req.cookies.get(STATE_COOKIE))
+        if req.query_params.get("error"):
+            return Response(f"身份中心拒绝登录：{req.query_params.get('error_description') or req.query_params['error']}",
+                            status_code=403, media_type="text/plain; charset=utf-8")
+        if not st or st["state"] != req.query_params.get("state"):
+            return RedirectResponse(f"{base}/auth/login", status_code=302)  # 状态过期，重新走一遍
+        try:
+            tok = await run_in_threadpool(oidc.exchange, req.query_params.get("code", ""))
+            claims = oidc.verify_id_token(tok["id_token"], st["nonce"])
+            info = await run_in_threadpool(oidc.userinfo, tok.get("access_token", ""))
+        except (OIDCError, requests.RequestException) as e:
+            return Response(f"登录失败：{e}", status_code=502, media_type="text/plain; charset=utf-8")
+        cookie, user = oidc.make_session(claims, info)
+        await run_in_threadpool(team.sso_touch, user["sub"], user["name"], user["email"])
+        resp = RedirectResponse(f"{base}{st['next']}", status_code=302)
+        resp.set_cookie(SESSION_COOKIE, cookie, max_age=int(oidc.cfg.session_hours * 3600), **cookie_opts(req))
+        resp.delete_cookie(STATE_COOKIE, path=f"{base}/")
+        return resp
+
+    async def auth_logout(req: Request):
+        url = await run_in_threadpool(oidc.logout_url)
+        resp = RedirectResponse(url, status_code=302)
+        resp.delete_cookie(SESSION_COOKIE, path=f"{base}/")
+        return resp
+
+    async def sso_users(req: Request):
+        if not oidc:
+            return err("当前不是全局账号登录模式", 400)
+        if not is_admin(req):
+            return err("只有管理员可以查看", 403)
+        items = await run_in_threadpool(team.sso_list)
+        for u in items:
+            u["fixed_admin"] = u["sub"] in oidc.cfg.admins or u["name"] in oidc.cfg.admins
+            if u["fixed_admin"]:
+                u["role"] = "admin"
+        return JSONResponse(items)
+
+    async def sso_user_role(req: Request):
+        if not oidc or not is_admin(req):
+            return err("只有管理员可以修改", 403)
+        body = await req.json()
+        try:
+            await run_in_threadpool(team.sso_set_role, req.path_params["sub"], str(body.get("role", "")))
+        except TeamError as e:
+            return err(str(e))
+        return JSONResponse({"ok": True})
+
     # ---------- 成员 ----------
     def admin_only(req: Request):
         if not is_admin(req):
@@ -810,6 +906,11 @@ def create_app(settings: Settings | None = None, data_dir: Path | None = None,
         Route("/api/projects/{pid}/events", events),
         Route("/api/stats", stats),
         Route("/api/system", system),
+        Route("/auth/login", auth_login),
+        Route("/auth/callback", auth_callback),
+        Route("/auth/logout", auth_logout),
+        Route("/api/sso-users", sso_users),
+        Route("/api/sso-users/{sub}", sso_user_role, methods=["PATCH"]),
         Route("/api/users", list_users, methods=["GET"]),
         Route("/api/users", add_user, methods=["POST"]),
         Route("/api/users/{name}", update_user, methods=["PATCH"]),
@@ -826,7 +927,7 @@ def create_app(settings: Settings | None = None, data_dir: Path | None = None,
         Route("/files/{pid}/{path:path}", files),
         Mount("/static", StaticFiles(directory=STATIC), name="static"),
     ]
-    middleware = [Middleware(Auth, team=team, password=password)]
+    middleware = [Middleware(Auth, team=team, password=password, oidc=oidc, base=base)]
     if base:
         # 子路径部署：反代把 /movie/... 原样转发过来，这里整体挂在 /movie 下
         inner = Starlette(routes=routes, middleware=middleware)

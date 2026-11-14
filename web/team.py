@@ -53,6 +53,9 @@ class TeamStore:
                 style TEXT NOT NULL DEFAULT '', ratio TEXT NOT NULL DEFAULT '9:16', duration INTEGER NOT NULL DEFAULT 30,
                 characters TEXT NOT NULL DEFAULT '[]', asset_ids TEXT NOT NULL DEFAULT '[]',
                 owner TEXT NOT NULL DEFAULT '', created REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS sso_users (
+                sub TEXT PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL DEFAULT '',
+                role TEXT NOT NULL DEFAULT 'member', first_seen REAL NOT NULL, last_seen REAL NOT NULL);
             CREATE TABLE IF NOT EXISTS assets (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, kind TEXT NOT NULL,
                 file TEXT NOT NULL, owner TEXT NOT NULL DEFAULT '', source TEXT NOT NULL DEFAULT '',
@@ -132,6 +135,38 @@ class TeamStore:
         """启动时用 ADMIN_USER / ADMIN_PASSWORD 创建首个管理员（已存在则跳过）。"""
         if name and password and not self.get_user(name):
             self.add_user(name, password, "admin")
+
+    # ---------- 全局账号（OIDC）成员 ----------
+    def sso_touch(self, sub: str, name: str, email: str = "") -> str:
+        """登录时记录成员，返回库里保存的角色。"""
+        now = time.time()
+        with self.lock:
+            self.conn.execute(
+                "INSERT INTO sso_users(sub, name, email, first_seen, last_seen) VALUES (?,?,?,?,?) "
+                "ON CONFLICT(sub) DO UPDATE SET name=excluded.name, email=excluded.email, last_seen=excluded.last_seen",
+                (sub, name, email, now, now))
+            self.conn.commit()
+            r = self.conn.execute("SELECT role FROM sso_users WHERE sub=?", (sub,)).fetchone()
+        return r["role"] if r else "member"
+
+    def sso_role(self, sub: str) -> str:
+        with self.lock:
+            r = self.conn.execute("SELECT role FROM sso_users WHERE sub=?", (sub,)).fetchone()
+        return r["role"] if r else "member"
+
+    def sso_list(self) -> list[dict]:
+        with self.lock:
+            return [dict(r) for r in self.conn.execute(
+                "SELECT sub, name, email, role, first_seen, last_seen FROM sso_users ORDER BY first_seen").fetchall()]
+
+    def sso_set_role(self, sub: str, role: str) -> None:
+        if role not in ROLES:
+            raise TeamError("角色只能是 admin 或 member")
+        with self.lock:
+            cur = self.conn.execute("UPDATE sso_users SET role=? WHERE sub=?", (role, sub))
+            self.conn.commit()
+        if not cur.rowcount:
+            raise TeamError("该成员还没登录过")
 
     # ---------- 模板 ----------
     def _tpl(self, r) -> dict:

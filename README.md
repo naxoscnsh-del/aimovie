@@ -178,3 +178,10 @@ SQLite 任务队列 + 后台线程（web/jobs.py）── 每个项目同一时�
 - 方舟返回的图片/视频链接 24 小时过期，系统会在生成后立即下载到本地
 - 首尾帧模式需所选 Seedance 版本支持（2.0 起支持 first_frame + last_frame）；不支持时请不要勾选过渡
 - TTS 音色 ID 需在火山引擎控制台确认已开通
+
+
+## 全局账号登录（OIDC）
+
+`.env` 设 `AUTH_MODE=oidc` 及 `OIDC_ISSUER / OIDC_CLIENT_ID / OIDC_CLIENT_SECRET / PUBLIC_URL / SESSION_SECRET`（见 `.env.example`），
+身份中心里为 `aimovie` 登记回调 `https://www.ainewimage.com/movie/auth/callback`。登录后用 id_token 的 `sub` 作账号标识；
+`OIDC_ADMINS` 里的人固定为管理员，其他人默认成员，管理员可在「成员」页调整。nginx 切换脚本加 `--no-gate` 去掉门户登录拦截，避免二次登录。
