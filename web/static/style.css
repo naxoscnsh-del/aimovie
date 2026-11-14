@@ -128,6 +128,7 @@ nav { gap: 16px; }
 .lib-item { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
 .lib-item img { display: block; width: 100%; aspect-ratio: 1; object-fit: cover; background: #eee; }
 .cand .tag { position: absolute; right: 6px; top: 6px; background: var(--warn); color: #fff; font-size: 11px; padding: 0 5px; border-radius: 4px; }
+.demobar { background: #fdf3e1; color: var(--warn); text-align: center; font-size: 13px; padding: 6px 12px; border-bottom: 1px solid #f1dcb4; }
 .empty { text-align: center; padding: 40px 0; color: var(--muted); }
 details summary { cursor: pointer; color: var(--muted); font-size: 13px; }
 

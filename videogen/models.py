@@ -85,10 +85,21 @@ class Seedance:
         resp = self.client.post("contents/generations/tasks", body)
         return resp["id"]
 
-    def poll(self, task_id: str) -> dict:
+    def cancel(self, task_id: str) -> None:
+        """尽量取消方舟侧任务（排队中的任务可取消；已在生成的可能无法取消）。"""
+        try:
+            self.client.request("DELETE", f"contents/generations/tasks/{task_id}")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def poll(self, task_id: str, should_stop=None) -> dict:
         """轮询到终态。成功返回任务详情（content.video_url 24 小时内有效）。"""
+        from .pipeline import Cancelled
         deadline = time.monotonic() + self.s.poll_timeout_s
         while True:
+            if should_stop and should_stop():
+                self.cancel(task_id)
+                raise Cancelled("任务已取消")
             task = self.client.get(f"contents/generations/tasks/{task_id}")
             status = task.get("status")
             if status in self.TERMINAL_OK:

@@ -58,6 +58,7 @@ const S = { cfg: null, project: null, tab: null, draft: null, dirty: false, poll
 window.addEventListener("hashchange", route);
 async function route() {
   clearTimeout(S.pollTimer);
+  closeEvents();
   if (S.dirty && !confirm("脚本有未保存的修改，确定离开？")) return;
   S.project = null; S.tab = null; S.draft = null; S.dirty = false; S.bodySig = "";
   const m = location.hash.match(/^#\/p\/([\w-]+)/);
@@ -152,8 +153,8 @@ function newForm(templates = [], assets = []) {
   const style = h("input", { type: "text", name: "style", placeholder: "可选，例如：日系胶片感、暖色调" });
   const submit = h("button", { class: "primary", type: "submit" }, "生成脚本");
   const warn = [];
-  if (!S.cfg.keys.deepseek || !S.cfg.keys.ark) warn.push("服务器未配置 API Key，生成会失败。");
-  if (!S.cfg.priced) warn.push("未配置模型单价，花费预估与 100 USD 熔断不生效。");
+  if (!S.cfg.demo && (!S.cfg.keys.deepseek || !S.cfg.keys.ark)) warn.push("服务器未配置 API Key，生成会失败。");
+  if (!S.cfg.demo && !S.cfg.priced) warn.push("未配置模型单价，花费预估与 100 USD 熔断不生效。");
   return h("form", { class: "panel stack", onsubmit: async (ev) => {
       ev.preventDefault();
       const fd = new FormData();
@@ -183,8 +184,26 @@ function newForm(templates = [], assets = []) {
 // ---------- 项目页 ----------
 async function projectPage(pid) {
   $("#app").replaceChildren(h("div", { id: "phead" }), h("div", { id: "pbanner" }), h("div", { id: "ptabs" }), h("div", { id: "pbody" }));
+  openEvents(pid);
   await refresh(pid);
 }
+
+// 实时推送：服务端有变化就推 update；连接失败时退回 2 秒轮询
+function openEvents(pid) {
+  closeEvents();
+  if (!window.EventSource) return;
+  S.sseOk = false;
+  let pending = null;
+  const es = new EventSource(`/api/projects/${pid}/events`);
+  es.onopen = () => { S.sseOk = true; };
+  es.addEventListener("update", () => {
+    clearTimeout(pending);
+    pending = setTimeout(() => { if (location.hash.includes(pid)) refresh(pid); }, 150);
+  });
+  es.onerror = () => { S.sseOk = false; };
+  S.es = es;
+}
+function closeEvents() { if (S.es) { S.es.close(); S.es = null; } S.sseOk = false; }
 
 async function refresh(pid) {
   clearTimeout(S.pollTimer);
@@ -192,7 +211,7 @@ async function refresh(pid) {
   catch (e) { $("#app").replaceChildren(h("div", { class: "empty" }, e.message, h("p", {}, h("a", { href: "#/" }, "返回首页")))); return; }
   if (!location.hash.includes(pid)) return;
   drawProject();
-  if (S.project.job) S.pollTimer = setTimeout(() => refresh(pid), 2000);
+  if (S.project.job && !S.sseOk) S.pollTimer = setTimeout(() => refresh(pid), 2000);
 }
 
 function defaultTab(p) {
@@ -230,7 +249,9 @@ function drawProject() {
   $("#pbanner").replaceChildren(!p.can_edit ? h("div", { class: "banner" }, h("div", {}, `只读：这是 ${p.owner} 的项目，只有本人或管理员可以修改。可以另存为模板或把场景图存入素材库。`)) : "", j ? h("div", { class: "banner" + (j.status === "failed" ? " bad" : "") },
     j.status === "failed" ? null : h("div", { class: "spin" }),
     h("div", { class: "grow" },
-      h("strong", {}, j.status === "failed" ? `${j.label}失败：${j.error || ""}` : `${j.label}${j.status === "queued" ? "（排队中）" : "中…"}`),
+      h("div", { class: "row spread" },
+        h("strong", {}, j.status === "failed" ? `${j.label}失败：${j.error || ""}` : `${j.label}${j.status === "queued" ? "（排队中）" : "中…"}`),
+        j.status !== "failed" && p.can_edit ? h("button", { class: "ghost small danger", onclick: () => cancelJob(j.id) }, "取消") : null),
       h("pre", {}, (j.log || "").trim().split("\n").slice(-6).join("\n")))) : "");
   // 标签页
   const shots = p.shots, nSel = shots.filter((s) => s.state.selected).length, nVid = shots.filter((s) => s.state.video).length;
@@ -245,6 +266,15 @@ function drawProject() {
   S.bodySig = sig; S.bodyTab = S.tab;
   const body = { script: scriptTab, images: imagesTab, videos: videosTab, final: finalTab }[S.tab](p, busy);
   $("#pbody").replaceChildren(body);
+}
+
+async function cancelJob(id) {
+  if (!confirm("取消这个任务？已经完成的图和视频会保留；正在生成的视频会尝试在方舟侧取消（已开始生成的可能仍会计费）。")) return;
+  try {
+    const r = await api(`/api/jobs/${id}/cancel`, { method: "POST" });
+    toast(r.status === "cancelled" ? "已取消" : "正在停止，当前步骤完成后结束");
+    await refresh(S.project.id);
+  } catch (e) { fail(e); }
 }
 
 async function duplicate() {
@@ -463,7 +493,9 @@ function finalTab(p, busy) {
   const voice = h("input", { type: "text", value: S.cfg.tts.voice, disabled: !S.cfg.tts.enabled || busy, placeholder: "音色 voice_type" });
   const meta = p.final_meta;
   const burn = h("input", { type: "checkbox", checked: meta ? !!meta.burn_subs : false, disabled: !hasNarr || busy });
-  const compose = () => startJob("compose", { bgm: p.has_bgm, tts: ttsOn.checked, voice: voice.value.trim(), burn_subs: burn.checked });
+  const fade = h("input", { type: "checkbox", checked: meta ? !!meta.transition : false, disabled: busy || p.shots.length < 2 });
+  const compose = () => startJob("compose", { bgm: p.has_bgm, tts: ttsOn.checked, voice: voice.value.trim(), burn_subs: burn.checked,
+    transition: fade.checked ? 0.5 : 0 });
   const others = S.cfg.ratios.filter((r) => r !== p.ratio);
   const exportPanel = p.final ? h("div", { class: "panel stack" },
     h("h2", {}, "导出其他画幅"),
@@ -474,7 +506,8 @@ function finalTab(p, busy) {
   return h("div", {},
     h("div", { class: "panel" },
       meta && p.final ? h("div", { class: "muted small", style: "text-align:center;margin-bottom:8px" },
-        [meta.tts ? `旁白配音（${meta.voice}）` : "无配音", meta.bgm ? "含 BGM" : "无 BGM", meta.burn_subs ? "字幕已烧录" : "软字幕"].join(" · ")) : null,
+        [meta.tts ? `旁白配音（${meta.voice}）` : "无配音", meta.bgm ? "含 BGM" : "无 BGM", meta.burn_subs ? "字幕已烧录" : "软字幕",
+          meta.transition ? "淡入淡出转场" : "硬切"].join(" · ")) : null,
       p.final ? [h("video", { class: "final", src: p.final, controls: true, playsinline: true }),
         h("div", { class: "row", style: "justify-content:center;margin-top:12px" },
           h("a", { href: p.final, download: `${p.title}.mp4` }, h("button", { class: "primary" }, "下载成片")),
@@ -488,6 +521,9 @@ function finalTab(p, busy) {
       h("label", { class: "check" }, ttsOn, "合成时加入旁白配音（设了说话人的镜头用该角色的音色）"),
       h("label", { class: "check" }, burn, "把字幕烧进画面（抖音、视频号等平台不显示软字幕时勾选）"),
       h("div", { style: "max-width:360px" }, h("label", {}, "音色（voice_type，见火山引擎音色列表）"), voice)),
+    h("div", { class: "panel stack" },
+      h("h2", {}, "剪辑"),
+      h("label", { class: "check" }, fade, "镜头之间 0.5 秒淡入淡出（成片会比镜头总时长略短，字幕和配音自动对齐）")),
     exportPanel,
     h("div", { class: "panel stack" },
       h("h2", {}, "背景音乐（可选）"),
@@ -668,10 +704,17 @@ async function loadSystem(ping) {
     h("div", { class: "muted small" }, `回收站里有 ${d.trash} 个已删除项目（data/trash）。后台任务线程 ${d.workers} 个。`, ping ? "" : " 连通测试只读取模型/任务列表，不产生生成费用。"));
 }
 
+function drawDemoBar() {
+  if (!S.cfg.demo || $("#demobar")) return;
+  document.body.insertBefore(h("div", { id: "demobar", class: "demobar" },
+    "演示模式：不调用真实接口、不花钱，图片和视频都是占位素材。正式使用前请关闭 DEMO_MODE。"), $("main"));
+}
+
 function drawNav() {
+  drawDemoBar();
   const links = [["#/templates", "模板"], ["#/library", "素材库"], ["#/stats", "成本看板"]];
   if (S.cfg.accounts || S.cfg.role === "admin") links.push(["#/members", S.cfg.role === "admin" ? "成员" : "账号"]);
-  $("#nav").replaceChildren(...links.map(([href, t]) => h("a", { href }, t)), S.cfg.user ? h("span", { class: "who" }, S.cfg.user) : null);
+  $("#nav").replaceChildren(...links.map(([href, t]) => h("a", { href }, t)), ...(S.cfg.user ? [h("span", { class: "who" }, S.cfg.user)] : []));
 }
 
 // ---------- 启动 ----------

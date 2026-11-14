@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Callable
 
 from . import cost as costmod
-from .compose import compose, probe_duration
+from .compose import compose, effective_lengths, probe_duration, segment_overlap
 from .config import Settings
 from .http import download as http_download
 from .models import Seedance, Seedream, VideoTaskFailed, VolcTTS
@@ -32,6 +32,10 @@ Log = Callable[[str], None]
 
 class StageError(RuntimeError):
     pass
+
+
+class Cancelled(StageError):
+    """用户取消了正在运行的任务。"""
 
 
 def _new_shot_state() -> dict:
@@ -115,6 +119,7 @@ class Pipeline:
                  script_client=None, downloader=http_download, tts=None):
         self.s = settings
         self.tts = tts
+        self.should_stop: Callable[[], bool] = lambda: False
         self.p = project
         self.log = log
         self.seedream = seedream or Seedream(settings)
@@ -122,6 +127,10 @@ class Pipeline:
         self.script_client = script_client
         self.download = downloader
         self.ledger = costmod.Ledger(settings, project.state["ledger"])
+
+    def _check_stop(self) -> None:
+        if self.should_stop():
+            raise Cancelled("任务已取消")
 
     def _set_status(self, status: str) -> None:
         self.p.state["status"] = status
@@ -259,6 +268,10 @@ class Pipeline:
             prompt = compose_image_prompt(script, shot)
             stamp = uuid.uuid4().hex[:4]  # 重出图时换文件名，避免浏览器缓存旧图
             for c in range(1, self.s.candidates_per_shot + 1):
+                if self.should_stop():
+                    st["status"] = "image_ready" if st["candidates"] else "pending"
+                    self.p.save()
+                    raise Cancelled("任务已取消，已生成的图保留")
                 self.ledger.ensure_room(price, f"第 {shot['index']} 镜场景图")
                 self.log(f"Seedream 第 {shot['index']} 镜 候选 {c}/{self.s.candidates_per_shot}")
                 try:
@@ -373,6 +386,8 @@ class Pipeline:
             attempts = 1 + max(0, self.s.video_auto_retry)
             err = None
             for attempt in range(1, attempts + 1):
+                if self.should_stop():
+                    return idx, "已取消"
                 with submit_lock:  # 提交前检查预算，串行化避免并发超支
                     self.ledger.ensure_room(cost_cny + in_flight[0], f"第 {idx} 镜视频")
                     in_flight[0] += cost_cny
@@ -391,9 +406,15 @@ class Pipeline:
                 self.log(f"Seedance 第 {idx} 镜已提交 {task_id}" + ("（首尾帧过渡）" if last_rel else "")
                          + (f"，第 {attempt} 次尝试" if attempt > 1 else ""))
                 try:
-                    task = self.seedance.poll(task_id)
+                    task = self.seedance.poll(task_id, should_stop=self.should_stop)
                     rel = f"videos/{sid}_{task_id[-6:]}.mp4"
                     self.download(task["content"]["video_url"], self.p.root / rel)
+                except Cancelled:
+                    with submit_lock:
+                        in_flight[0] -= cost_cny
+                        st.update(status=_status_after_video_cleared(st), error=None)
+                        self.p.save()
+                    return idx, "已取消"
                 except VideoTaskFailed as e:  # 生成失败（通常不计费），自动重试
                     with submit_lock:
                         in_flight[0] -= cost_cny
@@ -432,6 +453,8 @@ class Pipeline:
                 if err:
                     errors.append(f"第 {idx} 镜：{err}")
         self._set_status("shot_review")
+        if self.should_stop():
+            raise Cancelled("任务已取消，已完成的镜头保留")
         if errors:
             self.log("有镜头失败，可单独重跑：\n  " + "\n  ".join(errors))
 
@@ -465,7 +488,7 @@ class Pipeline:
         return tracks
 
     def run_compose(self, bgm: str | None = None, tts: bool = False, voice: str | None = None,
-                    burn_subs: bool = False) -> Path:
+                    burn_subs: bool = False, transition: float = 0.0) -> Path:
         shots = self.p.script["shots"]
         missing = [s["index"] for s in shots if not self.p.shot_state(s["id"])["video"]]
         if missing:
@@ -478,9 +501,13 @@ class Pipeline:
         try:
             narr = []
             if tts and any(s["narration"].strip() for s in shots):
-                narr = self._narration_audio(shots, [probe_duration(c) for c in clips], voice)
+                lengths = [probe_duration(c) for c in clips]
+                lengths = effective_lengths(lengths, segment_overlap(lengths, transition))
+                narr = self._narration_audio(shots, lengths, voice)
+            self._check_stop()
             out = compose(clips, [s["narration"] for s in shots], self.p.state["brief"]["ratio"],
-                          self.p.root / name, Path(bgm) if bgm else None, narration=narr, burn_subs=burn_subs)
+                          self.p.root / name, Path(bgm) if bgm else None, narration=narr, burn_subs=burn_subs,
+                          transition=transition)
         except Exception:
             self._set_status("shot_review")
             raise
@@ -496,7 +523,7 @@ class Pipeline:
         self.p.state["exports"] = {}
         self.p.state["final"] = name
         self.p.state["final_meta"] = {"tts": bool(narr), "bgm": bool(bgm), "voice": (voice or self.s.tts_voice) if narr else None,
-                                      "burn_subs": burn_subs}
+                                      "burn_subs": burn_subs, "transition": transition}
         self._set_status("done")
         self.log(f"成片已生成：{name}" + ("（含旁白配音）" if narr else ""))
         return out

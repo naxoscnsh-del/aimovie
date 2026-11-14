@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import json
@@ -21,7 +22,7 @@ from starlette.concurrency import run_in_threadpool
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import FileResponse, JSONResponse, Response
+from starlette.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
@@ -238,7 +239,8 @@ def create_app(settings: Settings | None = None, data_dir: Path | None = None,
             "ratios": list(RATIO_SIZES), "durations": s.seedance_durations,
             "candidates_per_shot": s.candidates_per_shot, "priced": s.pricing.configured,
             "keys": {"deepseek": bool(s.deepseek_api_key), "ark": bool(s.ark_api_key)},
-            "tts": {"enabled": s.tts_enabled, "voice": s.tts_voice},
+            "tts": {"enabled": s.tts_enabled or s.demo_mode, "voice": s.tts_voice},
+            "demo": s.demo_mode,
         })
 
     async def list_projects(_req):
@@ -417,10 +419,16 @@ def create_app(settings: Settings | None = None, data_dir: Path | None = None,
                 args = {"ratio": body["ratio"]}
             if kind == "compose":
                 args["burn_subs"] = bool(body.get("burn_subs"))
+                try:
+                    args["transition"] = float(body.get("transition") or 0)
+                except (TypeError, ValueError):
+                    return err("转场时长必须是数字")
+                if not 0 <= args["transition"] <= 1.5:
+                    return err("转场时长需在 0–1.5 秒")
                 if body.get("bgm") and p.state.get("bgm"):
                     args["bgm"] = p.state["bgm"]
                 if body.get("tts"):
-                    if not s.tts_enabled:
+                    if not (s.tts_enabled or s.demo_mode):
                         return err("服务器未配置 TTS，无法配音")
                     args["tts"] = True
                     voice = str(body.get("voice") or "").strip()
@@ -437,6 +445,59 @@ def create_app(settings: Settings | None = None, data_dir: Path | None = None,
             return err(str(e), 409)
         except ValueError as e:
             return err(str(e))
+
+    async def cancel_job(req: Request):
+        job = store.get(int(req.path_params["jid"]))
+        if not job:
+            return err("任务不存在", 404)
+        try:
+            ensure_edit(req, load(job["project"]))
+        except LookupError:
+            return err("项目不存在", 404)
+        except PermissionError as e:
+            return err(str(e), 403)
+        result = store.request_cancel(job["id"])
+        if result not in ("cancelled", "cancelling"):
+            return err("任务已经结束")
+        return JSONResponse({"status": result})
+
+    async def events(req: Request):
+        """SSE：项目状态或任务日志变化时推送 update 事件，前端收到后重新拉取。"""
+        pid = req.path_params["pid"]
+        try:
+            p = load(pid)
+        except LookupError:
+            return err("项目不存在", 404)
+        state_path = p.state_path
+
+        def signature():
+            try:
+                mtime = state_path.stat().st_mtime_ns
+            except FileNotFoundError:
+                mtime = 0
+            j = store.latest(pid)
+            return (mtime, j and j["id"], j and j["status"], j and len(j["log"]))
+
+        async def stream():
+            last, idle = None, 0
+            started = time.monotonic()
+            yield "retry: 3000\n\n"
+            while time.monotonic() - started < 1800:
+                if await req.is_disconnected():
+                    break
+                sig = await run_in_threadpool(signature)
+                if sig != last:
+                    if last is not None:
+                        yield "event: update\ndata: {}\n\n"
+                    last, idle = sig, 0
+                else:
+                    idle += 1
+                    if idle % 15 == 0:
+                        yield ": ping\n\n"
+                await asyncio.sleep(1)
+
+        return StreamingResponse(stream(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
     async def get_job(req: Request):
         job = store.get(int(req.path_params["jid"]))
@@ -715,6 +776,8 @@ def create_app(settings: Settings | None = None, data_dir: Path | None = None,
         Route("/api/projects/{pid}/bgm", upload_bgm, methods=["POST"]),
         Route("/api/projects/{pid}/jobs", create_job, methods=["POST"]),
         Route("/api/jobs/{jid:int}", get_job),
+        Route("/api/jobs/{jid:int}/cancel", cancel_job, methods=["POST"]),
+        Route("/api/projects/{pid}/events", events),
         Route("/api/stats", stats),
         Route("/api/system", system),
         Route("/api/users", list_users, methods=["GET"]),

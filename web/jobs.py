@@ -17,7 +17,7 @@ from typing import Callable
 
 from videogen.config import Settings
 from videogen.cost import BudgetExceeded
-from videogen.pipeline import Pipeline, Project, StageError
+from videogen.pipeline import Cancelled, Pipeline, Project, StageError
 
 KINDS = {"script", "images", "videos", "compose", "refine", "export"}
 KIND_LABEL = {"script": "生成脚本", "images": "生成场景图", "videos": "生成镜头视频", "compose": "合成成片",
@@ -42,6 +42,9 @@ class JobStore:
                 user TEXT NOT NULL DEFAULT '',
                 created REAL NOT NULL, started REAL, finished REAL)""")
             self.conn.execute("CREATE INDEX IF NOT EXISTS jobs_project ON jobs(project, id)")
+            cols = {r[1] for r in self.conn.execute("PRAGMA table_info(jobs)")}
+            if "cancel" not in cols:  # 旧库升级
+                self.conn.execute("ALTER TABLE jobs ADD COLUMN cancel INTEGER NOT NULL DEFAULT 0")
             self.conn.commit()
 
     def _row(self, r: sqlite3.Row | None) -> dict | None:
@@ -96,11 +99,31 @@ class JobStore:
                               (f"[{time.strftime('%H:%M:%S')}] {line}\n", job_id))
             self.conn.commit()
 
-    def finish(self, job_id: int, error: str | None = None) -> None:
+    def finish(self, job_id: int, error: str | None = None, status: str | None = None) -> None:
         with self.lock:
             self.conn.execute("UPDATE jobs SET status=?, error=?, finished=? WHERE id=?",
-                              ("failed" if error else "done", error, time.time(), job_id))
+                              (status or ("failed" if error else "done"), error, time.time(), job_id))
             self.conn.commit()
+
+    def request_cancel(self, job_id: int) -> str:
+        """排队中的直接取消；运行中的打标记，由流水线在检查点停下。返回取消后的状态。"""
+        with self.lock:
+            r = self.conn.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if not r or r["status"] not in ("queued", "running"):
+                return "finished" if r else "missing"
+            if r["status"] == "queued":
+                self.conn.execute("UPDATE jobs SET status='cancelled', error='已取消', finished=? WHERE id=?",
+                                  (time.time(), job_id))
+                self.conn.commit()
+                return "cancelled"
+            self.conn.execute("UPDATE jobs SET cancel=1 WHERE id=?", (job_id,))
+            self.conn.commit()
+            return "cancelling"
+
+    def cancel_requested(self, job_id: int) -> bool:
+        with self.lock:
+            r = self.conn.execute("SELECT cancel FROM jobs WHERE id=?", (job_id,)).fetchone()
+        return bool(r and r["cancel"])
 
     def stats(self, since: float = 0) -> list[dict]:
         """按任务类型统计成功率与平均耗时。"""
@@ -126,6 +149,9 @@ PipelineFactory = Callable[[Settings, Project, Callable[[str], None]], Pipeline]
 
 
 def default_factory(settings: Settings, project: Project, log) -> Pipeline:
+    if settings.demo_mode:
+        from videogen.demo import demo_pipeline
+        return demo_pipeline(settings, project, log)
     return Pipeline(settings, project, log=log)
 
 
@@ -167,6 +193,7 @@ class Runner:
         try:
             project = Project(self.runs_dir / job["project"])
             pipe = self.factory(self.s, project, log)
+            pipe.should_stop = lambda: self.store.cancel_requested(jid)
             args = job["args"]
             if job["kind"] == "script":
                 pipe.run_script()
@@ -179,9 +206,13 @@ class Runner:
             elif job["kind"] == "compose":
                 bgm = project.root / args["bgm"] if args.get("bgm") else None
                 pipe.run_compose(str(bgm) if bgm else None, tts=bool(args.get("tts")), voice=args.get("voice"),
-                                 burn_subs=bool(args.get("burn_subs")))
+                                 burn_subs=bool(args.get("burn_subs")), transition=float(args.get("transition") or 0))
             elif job["kind"] == "export":
                 pipe.export_ratio(str(args["ratio"]))
+        except Cancelled as e:
+            log(f"■ {e}")
+            self._restore_status(job)
+            self.store.finish(jid, str(e), status="cancelled")
         except (StageError, BudgetExceeded) as e:
             log(f"✗ {e}")
             self._restore_status(job)

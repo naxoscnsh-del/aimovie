@@ -12,6 +12,14 @@ from .pipeline import Pipeline, Project, StageError
 RUNS = Path("runs")
 
 
+def make(s: Settings, proj: Project) -> Pipeline:
+    if s.demo_mode:
+        from .demo import demo_pipeline
+        print("（演示模式：不调用真实接口，不花钱）")
+        return demo_pipeline(s, proj, print)
+    return Pipeline(s, proj)
+
+
 def _shots(text: str | None) -> list[int] | None:
     return [int(x) for x in text.split(",")] if text else None
 
@@ -24,6 +32,8 @@ def _latest() -> Path:
 
 
 def _check_keys(s: Settings, need_deepseek=False, need_ark=False) -> None:
+    if s.demo_mode:
+        return
     if need_deepseek and not s.deepseek_api_key:
         raise StageError("缺少 DEEPSEEK_API_KEY（写在 .env 里）")
     if need_ark and not s.ark_api_key:
@@ -67,7 +77,7 @@ def main(argv: list[str] | None = None) -> int:
             _check_keys(s, need_deepseek=True, need_ark=args.cmd == "run")
             proj = Project.create(RUNS, args.description, args.duration, args.ratio, args.style, args.ref)
             print(f"项目目录：{proj.root}")
-            pipe = Pipeline(s, proj)
+            pipe = make(s, proj)
             if args.cmd == "new":
                 pipe.run_script()
             else:
@@ -75,7 +85,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         proj = Project(Path(args.project) if args.project else _latest())
-        pipe = Pipeline(s, proj)
+        pipe = make(s, proj)
         if args.cmd == "script":
             _check_keys(s, need_deepseek=True)
             pipe.run_script()

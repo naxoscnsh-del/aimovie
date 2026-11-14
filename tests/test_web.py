@@ -121,7 +121,7 @@ def test_full_web_flow(server, tmp_path):
     assert r.status_code == 400
     p = job(server, pid, "compose", tts=True, voice="zh_test_voice")
     assert p["status"] == "done" and p["final"]
-    assert p["final_meta"] == {"tts": True, "bgm": False, "voice": "zh_test_voice", "burn_subs": False}
+    assert p["final_meta"] == {"tts": True, "bgm": False, "voice": "zh_test_voice", "burn_subs": False, "transition": 0.0}
     v = requests.get(server + p["final"], auth=AUTH, headers={"Range": "bytes=0-99"})
     assert v.status_code == 206 and len(v.content) == 100
     srt = requests.get(server + p["final"].replace(".mp4", ".srt"), auth=AUTH)

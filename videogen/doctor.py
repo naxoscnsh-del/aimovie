@@ -22,6 +22,8 @@ def _item(name: str, level: str, detail: str) -> dict:
 def check(settings: Settings, data_dir: Path | None = None, ping: bool = False, session=None) -> list[dict]:
     s = settings
     out: list[dict] = []
+    if s.demo_mode:
+        out.append(_item("演示模式", WARN, "DEMO_MODE=1：不调用真实接口、不花钱，素材为占位图。正式使用前关闭"))
     # 依赖
     for tool in ("ffmpeg", "ffprobe"):
         path = shutil.which(tool)

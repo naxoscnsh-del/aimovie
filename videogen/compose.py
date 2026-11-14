@@ -28,6 +28,17 @@ def reframe(src: Path, dest: Path, ratio: str) -> Path:
     return dest
 
 
+def segment_overlap(durs: list[float], transition: float) -> float:
+    """实际转场时长：不超过最短镜头的一半；只有一个镜头时为 0。"""
+    if transition <= 0 or len(durs) < 2:
+        return 0.0
+    return round(min(transition, min(durs) / 2), 3)
+
+
+def effective_lengths(durs: list[float], overlap: float) -> list[float]:
+    return [d - overlap for d in durs[:-1]] + durs[-1:] if overlap else list(durs)
+
+
 def _run(cmd: list[str]) -> None:
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
@@ -99,7 +110,8 @@ def write_srt(segments: list[tuple[float, str]], dest: Path) -> bool:
 
 def compose(clips: list[Path], narrations: list[str], ratio: str, out: Path,
             bgm: Path | None = None, fps: int = 24,
-            narration: list[tuple[float, Path]] | None = None, burn_subs: bool = False) -> Path:
+            narration: list[tuple[float, Path]] | None = None, burn_subs: bool = False,
+            transition: float = 0.0) -> Path:
     """narration: [(起始秒, 配音文件)]，按镜头起点放置；有配音时 BGM 自动压低。"""
     narration = narration or []
     work = out.parent / "_compose"
@@ -113,14 +125,29 @@ def compose(clips: list[Path], narrations: list[str], ratio: str, out: Path,
                      f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps}",
               "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", str(n)])
         normed.append(n)
-    lst = work / "list.txt"
-    lst.write_text("".join(f"file '{p.resolve()}'\n" for p in normed), encoding="utf-8")
+    durs = [probe_duration(p) for p in normed]
+    tr = segment_overlap(durs, transition)
     joined = work / "joined.mp4"
-    _run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(lst), "-c", "copy", str(joined)])
+    if tr:  # 淡入淡出：相邻镜头重叠 tr 秒
+        inputs, chain, prev, offset = [], [], "[0:v]", 0.0
+        for p in normed:
+            inputs += ["-i", str(p)]
+        for k in range(1, len(normed)):
+            offset += durs[k - 1] - tr
+            out_label = f"[x{k}]"
+            chain.append(f"{prev}[{k}:v]xfade=transition=fade:duration={tr:.3f}:offset={offset:.3f}{out_label}")
+            prev = out_label
+        _run(["ffmpeg", "-y", *inputs, "-filter_complex", ";".join(chain), "-map", prev,
+              "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", str(joined)])
+    else:
+        lst = work / "list.txt"
+        lst.write_text("".join(f"file '{p.resolve()}'\n" for p in normed), encoding="utf-8")
+        _run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(lst), "-c", "copy", str(joined)])
     total = probe_duration(joined)
+    segs = effective_lengths(durs, tr)  # 每镜在成片里占的时长（扣掉与下一镜的重叠）
 
     srt = work / "subs.srt"
-    has_subs = write_srt([(probe_duration(p), t) for p, t in zip(normed, narrations)], srt)
+    has_subs = write_srt(list(zip(segs, narrations)), srt)
 
     cmd = ["ffmpeg", "-y", "-i", str(joined)]
     audio_labels, filters, k = [], [], 1
@@ -142,7 +169,7 @@ def compose(clips: list[Path], narrations: list[str], ratio: str, out: Path,
     vcodec = ["-c:v", "copy"]
     if burn_subs and has_subs:  # 字幕画进画面（各平台都能看到）；同时仍保留软字幕轨
         ass = work / "subs.ass"
-        write_ass([(probe_duration(p), x) for p, x in zip(normed, narrations)], ass, w, h)
+        write_ass(list(zip(segs, narrations)), ass, w, h)
         filters.append(f"[0:v]ass={_escape_filter_path(ass)}[vout]")
         cmd += ["-map", "[vout]"]
         vcodec = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p"]

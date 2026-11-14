@@ -76,6 +76,7 @@ class Settings:
     def tts_enabled(self) -> bool:
         return bool(self.tts_appid and self.tts_token)
 
+    demo_mode: bool = False
     candidates_per_shot: int = 2
     max_parallel_videos: int = 3
     poll_interval_s: float = 10.0
@@ -113,6 +114,7 @@ class Settings:
             tts_cluster=env("TTS_CLUSTER", cls.tts_cluster),
             tts_voice=env("TTS_VOICE", cls.tts_voice),
             tts_url=env("TTS_URL", cls.tts_url),
+            demo_mode=env("DEMO_MODE", "").lower() in ("1", "true", "yes"),
             candidates_per_shot=_i("CANDIDATES_PER_SHOT", 2),
             max_parallel_videos=_i("MAX_PARALLEL_VIDEOS", 3),
             poll_interval_s=_f("POLL_INTERVAL_S", 10.0),
