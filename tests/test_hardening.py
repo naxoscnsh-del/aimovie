@@ -127,3 +127,12 @@ def test_compose_cleans_temp(tmp_path):
     pipe, _, _ = make_pipeline(tmp_path, settings())
     pipe.run_all()
     assert not (pipe.p.root / "_compose").exists()
+
+
+def test_doctor_demo_mode_downgrades_missing_keys(tmp_path):
+    s = settings()
+    s.demo_mode, s.deepseek_api_key, s.ark_api_key = True, "", ""
+    s.pricing.seedream_per_image = 0
+    items = {i["name"]: i["level"] for i in check(s, tmp_path)}
+    assert items["DeepSeek Key"] == "warn" and items["模型单价"] == "warn"
+    assert "fail" not in items.values()

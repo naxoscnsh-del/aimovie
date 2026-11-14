@@ -57,6 +57,10 @@ def check(settings: Settings, data_dir: Path | None = None, ping: bool = False, 
         out.append(_item("首尾帧过渡", WARN, "当前是 Seedance 1.x，首尾帧过渡可能不受支持，建议用 2.0 及以上"))
     out.append(_item("预算", OK, f"单片 ${s.budget_usd:.0f}，提醒线 ${s.budget_warn_usd:.0f}"))
     # 磁盘
+    if s.demo_mode:  # 演示模式不需要 Key 和单价，缺了只提示不算错误
+        for it in out:
+            if it["level"] == FAIL and it["name"] in ("DeepSeek Key", "火山方舟 Key", "模型单价"):
+                it["level"], it["detail"] = WARN, it["detail"] + "（演示模式下不需要，切正式模式前补上）"
     if data_dir is not None:
         data_dir = Path(data_dir)
         data_dir.mkdir(parents=True, exist_ok=True)
