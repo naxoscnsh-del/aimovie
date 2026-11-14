@@ -87,15 +87,19 @@ class OIDC:
     def redirect_uri(self) -> str:
         return f"{self.cfg.public_url}{self.base}/auth/callback"
 
-    def authorize_url(self, state: str, nonce: str) -> str:
+    def authorize_url(self, state: str, nonce: str, verifier: str = "") -> str:
         q = {"response_type": "code", "client_id": self.cfg.client_id, "redirect_uri": self.redirect_uri,
              "scope": self.cfg.scope, "state": state, "nonce": nonce}
+        if verifier:  # PKCE S256（身份中心要求）
+            q["code_challenge"] = _b64url(hashlib.sha256(verifier.encode()).digest())
+            q["code_challenge_method"] = "S256"
         return f"{self.discovery()['authorization_endpoint']}?{urlencode(q)}"
 
-    def exchange(self, code: str) -> dict:
+    def exchange(self, code: str, verifier: str = "") -> dict:
         d = self.discovery()
-        data = {"grant_type": "authorization_code", "code": code, "redirect_uri": self.redirect_uri,
-                "client_id": self.cfg.client_id, "client_secret": self.cfg.client_secret}
+        data = {"grant_type": "authorization_code", "code": code, "redirect_uri": self.redirect_uri}
+        if verifier:
+            data["code_verifier"] = verifier
         r = self.http.post(d["token_endpoint"], data=data, timeout=15,
                            auth=(self.cfg.client_id, self.cfg.client_secret))
         if r.status_code != 200:
@@ -167,10 +171,10 @@ class OIDC:
             return None
         return data if data.get("exp", 0) > time.time() else None
 
-    def new_state(self, next_path: str) -> tuple[str, str, str]:
-        state, nonce = secrets.token_urlsafe(16), secrets.token_urlsafe(16)
-        cookie = self._sign({"state": state, "nonce": nonce, "next": next_path, "exp": time.time() + 600})
-        return state, nonce, cookie
+    def new_state(self, next_path: str) -> tuple[str, str, str, str]:
+        state, nonce, verifier = secrets.token_urlsafe(16), secrets.token_urlsafe(16), secrets.token_urlsafe(48)
+        cookie = self._sign({"state": state, "nonce": nonce, "v": verifier, "next": next_path, "exp": time.time() + 600})
+        return state, nonce, verifier, cookie
 
     def read_state(self, cookie: str | None) -> dict | None:
         return self._unsign(cookie) if cookie else None

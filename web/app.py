@@ -615,8 +615,8 @@ def create_app(settings: Settings | None = None, data_dir: Path | None = None,
         if not nxt.startswith("/") or nxt.startswith("//"):
             nxt = "/"
         try:
-            state, nonce, cookie = oidc.new_state(nxt)
-            url = await run_in_threadpool(oidc.authorize_url, state, nonce)
+            state, nonce, verifier, cookie = oidc.new_state(nxt)
+            url = await run_in_threadpool(oidc.authorize_url, state, nonce, verifier)
         except (OIDCError, requests.RequestException) as e:
             return Response(f"无法连接身份中心：{e}", status_code=502, media_type="text/plain; charset=utf-8")
         resp = RedirectResponse(url, status_code=302)
@@ -631,7 +631,7 @@ def create_app(settings: Settings | None = None, data_dir: Path | None = None,
         if not st or st["state"] != req.query_params.get("state"):
             return RedirectResponse(f"{base}/auth/login", status_code=302)  # 状态过期，重新走一遍
         try:
-            tok = await run_in_threadpool(oidc.exchange, req.query_params.get("code", ""))
+            tok = await run_in_threadpool(oidc.exchange, req.query_params.get("code", ""), st.get("v", ""))
             claims = oidc.verify_id_token(tok["id_token"], st["nonce"])
             info = await run_in_threadpool(oidc.userinfo, tok.get("access_token", ""))
         except (OIDCError, requests.RequestException) as e:
