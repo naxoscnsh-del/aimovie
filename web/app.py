@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import binascii
 import json
 import os
@@ -22,7 +23,7 @@ from starlette.concurrency import run_in_threadpool
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import FileResponse, JSONResponse, Response, StreamingResponse
+from starlette.responses import FileResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
@@ -71,6 +72,14 @@ def looks_like_image(data: bytes) -> bool:
     return any(data.startswith(m) for m in IMAGE_MAGIC) or (data[:4] == b"RIFF" and data[8:12] == b"WEBP")
 
 
+def normalize_base(p: str) -> str:
+    """'' / '/' → ''；'movie' / '/movie/' → '/movie'"""
+    p = (p or "").strip().strip("/")
+    if p and not re.fullmatch(r"[A-Za-z0-9._~/-]+", p):
+        raise ValueError(f"BASE_PATH 不合法：{p}")
+    return f"/{p}" if p else ""
+
+
 class Auth(BaseHTTPMiddleware):
     """三种模式：
     1. 已建成员账号 → 用户名 + 各自密码（HTTP Basic）
@@ -93,7 +102,7 @@ class Auth(BaseHTTPMiddleware):
         return resp
 
     async def _dispatch(self, request: Request, call_next):
-        if request.url.path == "/healthz":  # 健康检查不需要登录
+        if request.url.path.endswith("/healthz"):  # 健康检查不需要登录
             return await call_next(request)
         has_users = await run_in_threadpool(self.team.has_users)
         if not has_users and not self.password:
@@ -121,7 +130,8 @@ class Auth(BaseHTTPMiddleware):
 
 def create_app(settings: Settings | None = None, data_dir: Path | None = None,
                factory=default_factory, workers: int | None = None,
-               password: str | None = None, team_budget_usd: float | None = None) -> Starlette:
+               password: str | None = None, team_budget_usd: float | None = None,
+               base_path: str | None = None) -> Starlette:
     s = settings or Settings.from_env()
     data = Path(data_dir or os.environ.get("DATA_DIR", "data"))
     runs = data / "runs"
@@ -131,6 +141,7 @@ def create_app(settings: Settings | None = None, data_dir: Path | None = None,
                     workers=workers if workers is not None else int(os.environ.get("WORKERS", 2)))
     password = password if password is not None else os.environ.get("APP_PASSWORD", "")
     team = TeamStore(data / "app.db", data / "library")
+    base = normalize_base(base_path if base_path is not None else os.environ.get("BASE_PATH", ""))
     team_budget = float(os.environ.get("TEAM_MONTHLY_BUDGET_USD", 0) or 0) if team_budget_usd is None else team_budget_usd
 
     # ---------- 工具 ----------
@@ -173,7 +184,7 @@ def create_app(settings: Settings | None = None, data_dir: Path | None = None,
         return Project(runs / pid)
 
     def furl(p: Project, rel: str | None) -> str | None:
-        return f"/files/{p.state['id']}/{rel}" if rel else None
+        return f"{base}/files/{p.state['id']}/{rel}" if rel else None
 
     def ensure_idle(pid: str) -> None:
         if store.active(pid):
@@ -234,8 +245,21 @@ def create_app(settings: Settings | None = None, data_dir: Path | None = None,
     async def healthz(_req):
         return JSONResponse({"ok": True, "demo": s.demo_mode, "workers": runner.workers})
 
+    def asset_version() -> str:
+        # 静态文件内容变了，引用地址就变，浏览器不会用旧缓存
+        h = hashlib.sha1()
+        for f in sorted(STATIC.iterdir()):
+            if f.suffix in (".js", ".css"):
+                h.update(f.read_bytes())
+        return h.hexdigest()[:10]
+
+    index_html = (STATIC / "index.html").read_text(encoding="utf-8")
+    ver = asset_version()
+    index_html = index_html.replace("static/style.css", f"static/style.css?{ver}").replace(
+        "static/app.js", f"static/app.js?{ver}")
+
     async def index(_req):
-        return FileResponse(STATIC / "index.html", headers={"Cache-Control": "no-cache"})
+        return Response(index_html, media_type="text/html; charset=utf-8", headers={"Cache-Control": "no-cache"})
 
     async def config(req):
         return JSONResponse({
@@ -594,7 +618,7 @@ def create_app(settings: Settings | None = None, data_dir: Path | None = None,
     # ---------- 模板 ----------
     def tpl_view(tp: dict) -> dict:
         assets = [team.get_asset(i) for i in tp["asset_ids"]]
-        return {**tp, "assets": [{"id": x["id"], "name": x["name"], "url": f"/library/{x['file']}"} for x in assets if x]}
+        return {**tp, "assets": [{"id": x["id"], "name": x["name"], "url": f"{base}/library/{x['file']}"} for x in assets if x]}
 
     async def list_templates(_req):
         return JSONResponse([tpl_view(x) for x in team.list_templates()])
@@ -627,7 +651,7 @@ def create_app(settings: Settings | None = None, data_dir: Path | None = None,
 
     # ---------- 素材库 ----------
     def asset_view(x: dict) -> dict:
-        return {**x, "url": f"/library/{x['file']}"}
+        return {**x, "url": f"{base}/library/{x['file']}"}
 
     async def list_assets(_req):
         return JSONResponse([asset_view(x) for x in team.list_assets()])
@@ -803,7 +827,17 @@ def create_app(settings: Settings | None = None, data_dir: Path | None = None,
         Mount("/static", StaticFiles(directory=STATIC), name="static"),
     ]
     middleware = [Middleware(Auth, team=team, password=password)]
-    app = Starlette(routes=routes, middleware=middleware, lifespan=lifespan)
+    if base:
+        # 子路径部署：反代把 /movie/... 原样转发过来，这里整体挂在 /movie 下
+        inner = Starlette(routes=routes, middleware=middleware)
+        app = Starlette(routes=[
+            Route("/healthz", healthz),
+            Route(base, lambda _r: RedirectResponse(base + "/", status_code=301)),
+            Mount(base, app=inner),
+        ], lifespan=lifespan)
+    else:
+        app = Starlette(routes=routes, middleware=middleware, lifespan=lifespan)
+    app.state.base = base
     app.state.store = store
     app.state.runner = runner
     app.state.team = team

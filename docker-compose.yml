@@ -8,7 +8,7 @@ services:
     image: aimovie:latest
     env_file: .env
     ports:
-      - "${APP_PORT:-8000}:8000"
+      - "${APP_BIND:-0.0.0.0}:${APP_PORT:-8000}:8000"   # 放在反代后面时 APP_BIND=127.0.0.1
     volumes:
       - ./data:/app/data   # 数据库、素材、成片都在这里，备份这个目录即可
     restart: unless-stopped

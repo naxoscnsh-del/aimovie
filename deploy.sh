@@ -3,17 +3,18 @@
 #   bash deploy.sh            首次部署（默认演示模式）/ 更新代码后重新部署
 #   bash deploy.sh --prod     首次部署即用正式模式（需随后在 .env 填 Key 和单价）
 #   bash deploy.sh --cn       国内服务器：构建时使用清华 apt / pip 镜像
-#   bash deploy.sh --port 8080
+#   bash deploy.sh --port 8010 --base /movie   部署到 域名/movie 子路径（只监听本机，由 Nginx 反代）
 set -euo pipefail
 cd "$(dirname "$0")"
 
-MODE="demo"; CN=0; PORT=""
+MODE="demo"; CN=0; PORT=""; BASE=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --prod) MODE="prod" ;;
     --cn) CN=1 ;;
     --port) PORT="$2"; shift ;;
-    -h|--help) sed -n '2,7p' "$0"; exit 0 ;;
+    --base) BASE="/$(echo "$2" | sed 's#^/*##; s#/*$##')"; shift ;;
+    -h|--help) sed -n '2,8p' "$0"; exit 0 ;;
     *) echo "未知参数：$1"; exit 1 ;;
   esac
   shift
@@ -49,7 +50,9 @@ else
   echo ".env 已存在，保留现有配置"
 fi
 [ -n "$PORT" ] && setkv APP_PORT "$PORT"
+if [ -n "$BASE" ]; then setkv BASE_PATH "$BASE"; setkv APP_BIND 127.0.0.1; fi
 APP_PORT="$(grep -E '^APP_PORT=' .env | cut -d= -f2 || true)"; APP_PORT="${APP_PORT:-8000}"
+BASE_PATH="$(grep -E '^BASE_PATH=' .env | cut -d= -f2 || true)"
 
 if [ "$CN" = 1 ]; then
   export APT_MIRROR="https://mirrors.tuna.tsinghua.edu.cn"
@@ -77,7 +80,12 @@ $DC exec -T app python -m videogen.doctor || true
 IP="$(hostname -I 2>/dev/null | awk '{print $1}')"; IP="${IP:-服务器IP}"
 DEMO="$(grep -E '^DEMO_MODE=' .env | cut -d= -f2)"
 say "部署完成"
-echo "  访问地址：http://${IP}:${APP_PORT}"
+if [ -n "$BASE_PATH" ]; then
+  echo "  本机地址：http://127.0.0.1:${APP_PORT}${BASE_PATH}/（只监听本机）"
+  echo "  对外访问：https://你的域名${BASE_PATH}/ —— 需在 Nginx 加 deploy/nginx-subpath.conf 里的配置"
+else
+  echo "  访问地址：http://${IP}:${APP_PORT}"
+fi
 if [ -n "$NEW_ADMIN_PW" ]; then
   echo "  管理员账号：admin"
   echo "  管理员密码：${NEW_ADMIN_PW}    （只显示这一次，也保存在 .env 的 ADMIN_PASSWORD）"

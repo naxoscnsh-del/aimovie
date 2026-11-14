@@ -161,3 +161,43 @@ def test_healthz_without_login(tmp_path):
     finally:
         srv.should_exit = True
         th.join(timeout=5)
+
+
+def test_sub_path_deployment(tmp_path):
+    import socket, uvicorn
+    from test_web import factory, web_settings
+    app = create_app(web_settings(), data_dir=tmp_path / "d", factory=factory, workers=1, password="pw",
+                     base_path="/movie/")
+    sock = socket.socket(); sock.bind(("127.0.0.1", 0)); port = sock.getsockname()[1]; sock.close()
+    srv = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning"))
+    th = threading.Thread(target=srv.run, daemon=True); th.start()
+    while not srv.started:
+        time.sleep(0.05)
+    b = f"http://127.0.0.1:{port}"
+    auth = ("小王".encode(), b"pw")
+    try:
+        assert requests.get(f"{b}/healthz").json()["ok"]
+        r = requests.get(f"{b}/movie", allow_redirects=False)
+        assert r.status_code == 301 and r.headers["location"] == "/movie/"
+        html = requests.get(f"{b}/movie/", auth=auth).text
+        assert 'href="static/style.css?' in html and 'src="static/app.js?' in html  # 相对地址 + 版本号
+        assert requests.get(f"{b}/movie/static/app.js", auth=auth).status_code == 200
+        assert requests.get(f"{b}/api/config", auth=auth).status_code == 404  # 不在子路径下的地址不响应
+        pid = requests.post(f"{b}/movie/api/projects", data={"description": "子路径部署测试"}, auth=auth).json()["id"]
+        for _ in range(100):
+            p = requests.get(f"{b}/movie/api/projects/{pid}", auth=auth).json()
+            if not p["job"]:
+                break
+            time.sleep(0.2)
+        requests.post(f"{b}/movie/api/projects/{pid}/jobs", json={"kind": "images"}, auth=auth)
+        for _ in range(100):
+            p = requests.get(f"{b}/movie/api/projects/{pid}", auth=auth).json()
+            if not p["job"]:
+                break
+            time.sleep(0.2)
+        url = p["shots"][0]["state"]["candidates"][0]
+        assert url.startswith(f"/movie/files/{pid}/")
+        assert requests.get(b + url, auth=auth).content[:4] == b"\x89PNG"
+    finally:
+        srv.should_exit = True
+        th.join(timeout=5)

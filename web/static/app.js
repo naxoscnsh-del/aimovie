@@ -2,6 +2,8 @@
 // AI 短片工作台 — 无构建步骤的单页应用
 
 // ---------- 工具 ----------
+// 部署在子路径（如 /movie/）时，所有接口地址都要带上这个前缀
+const BASE = location.pathname.replace(/\/[^/]*$/, "");
 const $ = (s, r = document) => r.querySelector(s);
 function h(tag, props, ...kids) {
   const el = document.createElement(tag);
@@ -23,7 +25,7 @@ async function api(path, opts = {}) {
   const init = { method: opts.method || "GET", headers: {} };
   if (opts.form) init.body = opts.form;
   else if (opts.body !== undefined) { init.body = JSON.stringify(opts.body); init.headers["Content-Type"] = "application/json"; }
-  const r = await fetch(path, init);
+  const r = await fetch(path.startsWith("/") ? BASE + path : path, init);
   let data = null;
   try { data = await r.json(); } catch (_) { /* 非 JSON */ }
   if (!r.ok) throw new Error((data && data.error) || `请求失败（${r.status}）`);
@@ -194,7 +196,7 @@ function openEvents(pid) {
   if (!window.EventSource) return;
   S.sseOk = false;
   let pending = null;
-  const es = new EventSource(`/api/projects/${pid}/events`);
+  const es = new EventSource(`${BASE}/api/projects/${pid}/events`);
   es.onopen = () => { S.sseOk = true; };
   es.addEventListener("update", () => {
     clearTimeout(pending);
