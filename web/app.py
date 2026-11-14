@@ -138,7 +138,7 @@ def create_app(settings: Settings | None = None, data_dir: Path | None = None,
     runs.mkdir(parents=True, exist_ok=True)
     store = JobStore(data / "app.db")
     runner = Runner(store, s, runs, factory=factory,
-                    workers=workers if workers is not None else int(os.environ.get("WORKERS", 2)))
+                    workers=workers if workers is not None else int(os.environ.get("WORKERS") or 2))
     password = password if password is not None else os.environ.get("APP_PASSWORD", "")
     team = TeamStore(data / "app.db", data / "library")
     base = normalize_base(base_path if base_path is not None else os.environ.get("BASE_PATH", ""))

@@ -19,8 +19,12 @@ docker compose up -d --build      # 打开 http://localhost:8000
 
 ```bash
 cd /data && tar xzf aimovie-<提交号>.tar.gz && cd /data/aimovie
-bash deploy.sh --port 8010 --base /movie     # 国内网络再加 --cn
+bash deploy.sh --port 8010 --base /movie --cn     # --cn：基础镜像、apt、pip 都走国内源
 ```
+
+`--cn` 会依次尝试 docker.1ms.run、docker.m.daocloud.io、docker.1panel.live 拉基础镜像，用第一个能用的；
+apt 和 pip 用阿里云镜像。这些设置写进 `.env`，之后更新时 `docker compose up -d --build app` 自动沿用。
+如果三个入口都拉不下来，在 `/etc/docker/daemon.json` 配置 `registry-mirrors` 后 `systemctl restart docker` 再试。
 
 然后把 `deploy/nginx-subpath.conf` 里的两段 `location` 加进 ainewimage.com 的 Nginx 配置，`nginx -t && nginx -s reload`。
 

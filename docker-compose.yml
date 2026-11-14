@@ -3,6 +3,7 @@ services:
     build:
       context: .
       args:
+        BASE_IMAGE: ${BASE_IMAGE:-python:3.12-slim}
         APT_MIRROR: ${APT_MIRROR:-}
         PIP_INDEX_URL: ${PIP_INDEX_URL:-}
     image: aimovie:latest

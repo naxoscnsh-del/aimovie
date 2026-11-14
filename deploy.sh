@@ -2,7 +2,7 @@
 # AI 短片工作台 一键部署
 #   bash deploy.sh            首次部署（默认演示模式）/ 更新代码后重新部署
 #   bash deploy.sh --prod     首次部署即用正式模式（需随后在 .env 填 Key 和单价）
-#   bash deploy.sh --cn       国内服务器：构建时使用清华 apt / pip 镜像
+#   bash deploy.sh --cn       国内服务器：基础镜像、apt、pip 都走国内源（设置会写进 .env，之后更新自动沿用）
 #   bash deploy.sh --port 8010 --base /movie   部署到 域名/movie 子路径（只监听本机，由 Nginx 反代）
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -55,9 +55,28 @@ APP_PORT="$(grep -E '^APP_PORT=' .env | cut -d= -f2 || true)"; APP_PORT="${APP_P
 BASE_PATH="$(grep -E '^BASE_PATH=' .env | cut -d= -f2 || true)"
 
 if [ "$CN" = 1 ]; then
-  export APT_MIRROR="https://mirrors.tuna.tsinghua.edu.cn"
-  export PIP_INDEX_URL="https://pypi.tuna.tsinghua.edu.cn/simple"
-  echo "使用国内镜像构建（拉取 python 基础镜像仍需 Docker Hub 可访问，必要时配置 registry-mirrors）"
+  say "国内网络：配置镜像源"
+  setkv APT_MIRROR "https://mirrors.aliyun.com"
+  setkv PIP_INDEX_URL "https://mirrors.aliyun.com/pypi/simple/"
+  # 基础镜像：依次尝试几个国内 Docker Hub 加速入口，用第一个拉得下来的
+  CUR_BASE="$(grep -E '^BASE_IMAGE=' .env | cut -d= -f2 || true)"
+  if [ -n "$CUR_BASE" ] && docker image inspect "$CUR_BASE" >/dev/null 2>&1; then
+    echo "基础镜像已在本机：$CUR_BASE"
+  else
+    picked=""
+    for reg in docker.1ms.run docker.m.daocloud.io docker.1panel.live; do
+      img="$reg/library/python:3.12-slim"
+      echo "尝试拉取 $img ..."
+      if timeout 300 docker pull -q "$img" >/dev/null 2>&1; then picked="$img"; break; fi
+    done
+    if [ -n "$picked" ]; then
+      setkv BASE_IMAGE "$picked"; echo "使用基础镜像：$picked"
+    elif docker image inspect python:3.12-slim >/dev/null 2>&1; then
+      setkv BASE_IMAGE python:3.12-slim; echo "加速入口都不可用，使用本机已有的 python:3.12-slim"
+    else
+      die "国内加速入口都拉不到 python:3.12-slim。请在 /etc/docker/daemon.json 配置 registry-mirrors 后重试（见 README）"
+    fi
+  fi
 fi
 mkdir -p data backups
 

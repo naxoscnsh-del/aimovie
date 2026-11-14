@@ -1,11 +1,14 @@
-FROM python:3.12-slim
+# 国内服务器：deploy.sh --cn 会把下面三个参数换成国内源（写在 .env 里，更新时自动沿用）
+ARG BASE_IMAGE=python:3.12-slim
+FROM ${BASE_IMAGE}
 
-# 国内服务器可在构建时传入镜像源加速：见 deploy.sh --cn
 ARG APT_MIRROR=""
 ARG PIP_INDEX_URL=""
 
 RUN if [ -n "$APT_MIRROR" ]; then \
-      sed -i "s#http://deb.debian.org#${APT_MIRROR}#g" /etc/apt/sources.list.d/debian.sources 2>/dev/null || true; \
+      for f in /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list; do \
+        [ -f "$f" ] && sed -i -E "s#https?://deb.debian.org#${APT_MIRROR}#g" "$f"; \
+      done; \
     fi \
  && apt-get update \
  && apt-get install -y --no-install-recommends ffmpeg fonts-noto-cjk curl \

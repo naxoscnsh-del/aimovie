@@ -20,11 +20,20 @@ def load_dotenv(path: str | Path = ".env") -> None:
 
 
 def _f(name: str, default: float) -> float:
-    return float(os.environ.get(name, default))
+    """空值（.env 里写了 KEY= 但没填）按默认值处理。"""
+    v = os.environ.get(name, "").strip()
+    try:
+        return float(v) if v else default
+    except ValueError:
+        raise ValueError(f".env 里 {name}={v!r} 不是数字") from None
 
 
 def _i(name: str, default: int) -> int:
-    return int(os.environ.get(name, default))
+    v = os.environ.get(name, "").strip()
+    try:
+        return int(v) if v else default
+    except ValueError:
+        raise ValueError(f".env 里 {name}={v!r} 不是整数") from None
 
 
 @dataclass
@@ -92,8 +101,9 @@ class Settings:
     @classmethod
     def from_env(cls) -> "Settings":
         load_dotenv()
-        env = os.environ.get
-        durations = env("SEEDANCE_DURATIONS", "5,10")
+        def env(k, d=None):  # 空值视为未设置
+            return (os.environ.get(k) or "").strip() or d
+        durations = env("SEEDANCE_DURATIONS", "") or "5,10"
         return cls(
             deepseek_api_key=env("DEEPSEEK_API_KEY", ""),
             deepseek_base_url=env("DEEPSEEK_BASE_URL", cls.deepseek_base_url),

@@ -201,3 +201,18 @@ def test_sub_path_deployment(tmp_path):
     finally:
         srv.should_exit = True
         th.join(timeout=5)
+
+
+def test_settings_tolerate_blank_env(monkeypatch, tmp_path):
+    """.env.example 里留空的项（KEY=）不能让服务启动失败。"""
+    from videogen.config import Settings
+    monkeypatch.chdir(tmp_path)
+    for line in open(__import__("pathlib").Path(__file__).parent.parent / ".env.example", encoding="utf-8"):
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            k, v = line.split("=", 1)
+            monkeypatch.setenv(k, v)
+    s = Settings.from_env()
+    assert s.pricing.seedream_per_image == 0 and s.seedance_durations == [5, 10] and s.budget_usd == 100
+    app = create_app(s, data_dir=tmp_path / "d", workers=0)
+    assert app is not None
