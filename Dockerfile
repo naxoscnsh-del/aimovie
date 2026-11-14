@@ -5,14 +5,15 @@ FROM ${BASE_IMAGE}
 ARG APT_MIRROR=""
 ARG PIP_INDEX_URL=""
 
-RUN if [ -n "$APT_MIRROR" ]; then \
+RUN set -eux; \
+    if [ -n "$APT_MIRROR" ]; then \
       for f in /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list; do \
-        [ -f "$f" ] && sed -i -E "s#https?://deb.debian.org#${APT_MIRROR}#g" "$f"; \
+        if [ -f "$f" ]; then sed -i -E "s#https?://deb.debian.org#${APT_MIRROR}#g" "$f"; fi; \
       done; \
-    fi \
- && apt-get update \
- && apt-get install -y --no-install-recommends ffmpeg fonts-noto-cjk curl \
- && rm -rf /var/lib/apt/lists/*
+    fi; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ffmpeg fonts-noto-cjk curl; \
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY requirements.txt .

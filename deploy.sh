@@ -56,7 +56,7 @@ BASE_PATH="$(grep -E '^BASE_PATH=' .env | cut -d= -f2 || true)"
 
 if [ "$CN" = 1 ]; then
   say "国内网络：配置镜像源"
-  setkv APT_MIRROR "https://mirrors.aliyun.com"
+  setkv APT_MIRROR "http://mirrors.aliyun.com"
   setkv PIP_INDEX_URL "https://mirrors.aliyun.com/pypi/simple/"
   # 基础镜像：依次尝试几个国内 Docker Hub 加速入口，用第一个拉得下来的
   CUR_BASE="$(grep -E '^BASE_IMAGE=' .env | cut -d= -f2 || true)"
