@@ -19,9 +19,9 @@ from videogen.config import Settings
 from videogen.cost import BudgetExceeded
 from videogen.pipeline import Pipeline, Project, StageError
 
-KINDS = {"script", "images", "videos", "compose", "refine"}
+KINDS = {"script", "images", "videos", "compose", "refine", "export"}
 KIND_LABEL = {"script": "生成脚本", "images": "生成场景图", "videos": "生成镜头视频", "compose": "合成成片",
-              "refine": "修改场景图"}
+              "refine": "修改场景图", "export": "导出其他画幅"}
 
 
 class ProjectBusy(RuntimeError):
@@ -178,7 +178,10 @@ class Runner:
                 pipe.refine_image(int(args["shot"]), int(args["candidate"]), str(args["instruction"]))
             elif job["kind"] == "compose":
                 bgm = project.root / args["bgm"] if args.get("bgm") else None
-                pipe.run_compose(str(bgm) if bgm else None, tts=bool(args.get("tts")), voice=args.get("voice"))
+                pipe.run_compose(str(bgm) if bgm else None, tts=bool(args.get("tts")), voice=args.get("voice"),
+                                 burn_subs=bool(args.get("burn_subs")))
+            elif job["kind"] == "export":
+                pipe.export_ratio(str(args["ratio"]))
         except (StageError, BudgetExceeded) as e:
             log(f"✗ {e}")
             self._restore_status(job)
@@ -199,7 +202,7 @@ class Runner:
             return
         back = {"script": "failed" if not p.has_script else "script_review",
                 "images": "image_review", "videos": "shot_review", "compose": "shot_review",
-                "refine": "image_review"}
+                "refine": "image_review", "export": "done"}
         if p.state["status"] in {"scripting", "imaging", "generating", "rendering", "draft"}:
             p.state["status"] = back[job["kind"]]
             p.save()

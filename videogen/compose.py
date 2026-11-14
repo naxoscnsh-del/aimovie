@@ -8,6 +8,26 @@ OUT_SIZES = {"9:16": (720, 1280), "16:9": (1280, 720), "1:1": (960, 960),
              "3:4": (720, 960), "4:3": (960, 720)}
 
 
+SUB_FONT = "Noto Sans CJK SC"
+
+
+def _escape_filter_path(p: Path) -> str:
+    """ffmpeg 滤镜参数里的路径需要转义冒号、引号等。"""
+    s = str(Path(p).resolve()).replace("\\", "/")
+    return s.replace(":", "\\:").replace("'", "\\'").replace(",", "\\,")
+
+
+def reframe(src: Path, dest: Path, ratio: str) -> Path:
+    """转画幅：前景完整缩放居中，背景用同一画面放大裁切并模糊。"""
+    w, h = OUT_SIZES[ratio]
+    vf = (f"split[a][b];[a]scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},boxblur=24:2[bg];"
+          f"[b]scale={w}:{h}:force_original_aspect_ratio=decrease[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1[v]")
+    _run(["ffmpeg", "-y", "-i", str(src), "-filter_complex", vf, "-map", "[v]", "-map", "0:a?",
+          "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-c:a", "copy",
+          "-movflags", "+faststart", str(dest)])
+    return dest
+
+
 def _run(cmd: list[str]) -> None:
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
@@ -31,6 +51,39 @@ def probe_duration(path: Path) -> float:
         return 0.0
 
 
+def _ass_ts(sec: float) -> str:
+    cs = int(round(sec * 100))
+    h, cs = divmod(cs, 360000)
+    m, cs = divmod(cs, 6000)
+    s, cs = divmod(cs, 100)
+    return f"{h}:{m:02}:{s:02}.{cs:02}"
+
+
+def write_ass(segments: list[tuple[float, str]], dest: Path, w: int, h: int) -> None:
+    """生成 ASS 字幕，虚拟分辨率 = 视频分辨率，字号和边距直接按像素算。"""
+    size = round(min(w, h) * 0.065)       # 字号约为短边的 6.5%（手机上清晰可读）
+    margin_v = round(h * 0.08)            # 距底部 8%
+    margin_lr = round(w * 0.06)
+    lines = [
+        "[Script Info]", "ScriptType: v4.00+", f"PlayResX: {w}", f"PlayResY: {h}",
+        "WrapStyle: 0", "ScaledBorderAndShadow: yes", "",
+        "[V4+ Styles]",
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, "
+        "Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, "
+        "MarginL, MarginR, MarginV, Encoding",
+        f"Style: Default,{SUB_FONT},{size},&H00FFFFFF,&H000000FF,&H99000000,&H00000000,1,0,0,0,100,100,0,0,1,"
+        f"{max(1, round(size / 16))},0,2,{margin_lr},{margin_lr},{margin_v},1",
+        "", "[Events]", "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+    ]
+    t = 0.0
+    for dur, text in segments:
+        text = text.strip().replace("{", "（").replace("}", "）").replace("\n", "\\N")
+        if text:
+            lines.append(f"Dialogue: 0,{_ass_ts(t)},{_ass_ts(t + dur)},Default,,0,0,0,,{text}")
+        t += dur
+    dest.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def write_srt(segments: list[tuple[float, str]], dest: Path) -> bool:
     """segments: [(时长, 字幕)]，空字幕跳过。返回是否写出了内容。"""
     lines, t, n = [], 0.0, 0
@@ -46,7 +99,7 @@ def write_srt(segments: list[tuple[float, str]], dest: Path) -> bool:
 
 def compose(clips: list[Path], narrations: list[str], ratio: str, out: Path,
             bgm: Path | None = None, fps: int = 24,
-            narration: list[tuple[float, Path]] | None = None) -> Path:
+            narration: list[tuple[float, Path]] | None = None, burn_subs: bool = False) -> Path:
     """narration: [(起始秒, 配音文件)]，按镜头起点放置；有配音时 BGM 自动压低。"""
     narration = narration or []
     work = out.parent / "_compose"
@@ -86,15 +139,25 @@ def compose(clips: list[Path], narrations: list[str], ratio: str, out: Path,
     if has_subs:
         cmd += ["-i", str(srt)]
         sub_idx = k
-    cmd += ["-map", "0:v"]
+    vcodec = ["-c:v", "copy"]
+    if burn_subs and has_subs:  # 字幕画进画面（各平台都能看到）；同时仍保留软字幕轨
+        ass = work / "subs.ass"
+        write_ass([(probe_duration(p), x) for p, x in zip(normed, narrations)], ass, w, h)
+        filters.append(f"[0:v]ass={_escape_filter_path(ass)}[vout]")
+        cmd += ["-map", "[vout]"]
+        vcodec = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p"]
+    else:
+        cmd += ["-map", "0:v"]
     if audio_labels:
         mix = "".join(audio_labels)
         filters.append(f"{mix}amix=inputs={len(audio_labels)}:duration=longest:normalize=0,"
                        f"apad,atrim=0:{total:.3f}[aout]")
-        cmd += ["-filter_complex", ";".join(filters), "-map", "[aout]", "-c:a", "aac", "-b:a", "160k"]
+        cmd += ["-map", "[aout]", "-c:a", "aac", "-b:a", "160k"]
+    if filters:
+        cmd += ["-filter_complex", ";".join(filters)]
     if sub_idx is not None:
         cmd += ["-map", f"{sub_idx}:s", "-c:s", "mov_text", "-metadata:s:s:0", "language=chi"]
-    cmd += ["-c:v", "copy", "-t", f"{total:.3f}", "-movflags", "+faststart", str(out)]
+    cmd += [*vcodec, "-t", f"{total:.3f}", "-movflags", "+faststart", str(out)]
     _run(cmd)
     if has_subs:
         (out.with_suffix(".srt")).write_text(srt.read_text(encoding="utf-8"), encoding="utf-8")

@@ -25,7 +25,8 @@ SYSTEM_PROMPT = """你是短视频编剧兼分镜师。根据用户的场景描�
       "image_prompt": "场景图提示词：只描述这一帧静态画面——主体、动作姿态、环境、构图、光线。不要写镜头运动",
       "video_prompt": "视频提示词：描述画面如何动起来——人物动作、物体变化、镜头运动（推/拉/摇/移/跟），一句到两句",
       "duration": 5,
-      "narration": "这一镜的旁白或字幕，可为空字符串",
+      "narration": "这一镜的旁白、台词或字幕，可为空字符串",
+      "speaker": "说这句话的角色名；画外旁白填空字符串",
       "link_next": false
     }
   ]
@@ -40,6 +41,9 @@ SYSTEM_PROMPT = """你是短视频编剧兼分镜师。根据用户的场景描�
 - link_next：这一镜和下一镜是同一场景里连续的动作（例如人物从门口走到吧台）时填 true，视频会从本镜画面平滑过渡到下一镜画面；换场景、跳切时填 false。最后一镜必须是 false。
 - 旁白每镜不超过（时长 × 4）个字，保证念得完。
 """
+
+
+VOICE_RE = re.compile(r"[A-Za-z0-9_.-]{2,64}")
 
 
 class ScriptError(ValueError):
@@ -109,10 +113,19 @@ def validate_script(data: dict, allowed: list[int]) -> dict:
             "duration": snap_duration(s.get("duration"), allowed),
             "narration": str(s.get("narration", "") or ""),
             "link_next": bool(s.get("link_next", False)) and i < len(shots),
+            "speaker": s.get("speaker") if s.get("speaker") in names else "",
         })
+    out_chars = []
+    for c in chars:
+        item = {"name": c["name"], "appearance": c["appearance"]}
+        voice = str(c.get("voice") or "").strip()
+        if voice:
+            if not VOICE_RE.fullmatch(voice):
+                raise ScriptError(f"角色 {c['name']} 的音色 ID 格式不对")
+            item["voice"] = voice
+        out_chars.append(item)
     return {"title": data["title"].strip(), "style": data["style"].strip(),
-            "characters": [{"name": c["name"], "appearance": c["appearance"]} for c in chars],
-            "shots": clean}
+            "characters": out_chars, "shots": clean}
 
 
 def generate_script(settings: Settings, brief: dict, client: HttpClient | None = None,

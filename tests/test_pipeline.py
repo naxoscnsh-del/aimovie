@@ -314,3 +314,50 @@ def test_compose_tts_requires_config(tmp_path):
     pipe.run_all()
     with pytest.raises(StageError, match="TTS"):
         pipe.run_compose(tts=True)
+
+
+def test_character_voices_and_speaker(tmp_path):
+    s = settings()
+    pipe, _, _ = make_pipeline(tmp_path, s)
+    pipe.tts = FakeTTS()
+    pipe.run_script()
+    sc = pipe.p.script
+    sc["characters"][0]["voice"] = "zh_xiaolin_voice"
+    sc["shots"][1]["narration"] = "今天的第一杯"
+    sc["shots"][1]["speaker"] = "小林"
+    sc["shots"][0]["speaker"] = "不存在的人"  # 未定义角色 → 视为旁白
+    sc = pipe.update_script(sc)
+    assert sc["shots"][0]["speaker"] == "" and sc["shots"][1]["speaker"] == "小林"
+    pipe.run_images(); pipe.select(auto=True); pipe.run_videos()
+    pipe.run_compose(tts=True, voice="narrator_v")
+    assert pipe.tts.calls == [("早上七点", "narrator_v"), ("今天的第一杯", "zh_xiaolin_voice")]
+    bad = pipe.p.script
+    bad["characters"][0]["voice"] = "bad voice!"
+    with pytest.raises(Exception, match="音色"):
+        pipe.update_script(bad)
+
+
+def test_burn_subs_and_export(tmp_path):
+    import subprocess
+    pipe, _, _ = make_pipeline(tmp_path, settings())
+    pipe.run_all()
+    plain = pipe.p.root / pipe.p.state["final"]
+    frame_plain = subprocess.run(["ffmpeg", "-v", "error", "-ss", "0.5", "-i", str(plain), "-frames:v", "1",
+                                  "-f", "rawvideo", "-pix_fmt", "gray", "-"], capture_output=True).stdout
+    out = pipe.run_compose(burn_subs=True)
+    assert pipe.p.state["final_meta"]["burn_subs"]
+    frame_burn = subprocess.run(["ffmpeg", "-v", "error", "-ss", "0.5", "-i", str(out), "-frames:v", "1",
+                                 "-f", "rawvideo", "-pix_fmt", "gray", "-"], capture_output=True).stdout
+    assert len(frame_plain) == len(frame_burn) > 0
+    diff = sum(1 for a, b in zip(frame_plain, frame_burn) if abs(a - b) > 40)
+    assert diff > 200  # 字幕确实画进了画面
+    # 导出 16:9：尺寸正确，音视频齐全；重新合成后旧导出作废
+    e = pipe.export_ratio("16:9")
+    dims = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height",
+                           "-of", "csv=p=0", str(e)], capture_output=True, text=True).stdout.strip()
+    assert dims == "1280,720"
+    assert pipe.p.state["exports"]["16:9"] == e.name and pipe.p.state["status"] == "done"
+    with pytest.raises(StageError):
+        pipe.export_ratio("9:16")  # 原画幅
+    pipe.run_compose()
+    assert pipe.p.state["exports"] == {} and not e.exists()

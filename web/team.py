@@ -172,8 +172,9 @@ class TeamStore:
                 "VALUES (?,?,?,?,?,?,?,?,?)",
                 (name, str(data.get("description", "")).strip()[:500], str(data.get("style", "")).strip()[:300],
                  str(data.get("ratio", "9:16")), duration,
-                 json.dumps([{"name": c["name"][:20], "appearance": c["appearance"][:300]} for c in chars],
-                            ensure_ascii=False),
+                 json.dumps([{"name": c["name"][:20], "appearance": c["appearance"][:300],
+                              **({"voice": c["voice"]} if re.fullmatch(r"[A-Za-z0-9_.-]{2,64}", str(c.get("voice") or ""))
+                                 else {})} for c in chars], ensure_ascii=False),
                  json.dumps(asset_ids), owner, time.time()))
             self.conn.commit()
         return self.get_template(cur.lastrowid)

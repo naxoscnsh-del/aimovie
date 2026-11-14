@@ -280,7 +280,8 @@ function scriptTab(p, busy) {
   const redraw = () => { const sig = S.dirty; $("#pbody").replaceChildren(scriptTab(p, busy)); S.dirty = sig; if (sig) saveBtnRef().disabled = false; };
 
   const chars = h("div", { class: "stack" }, d.characters.map((ch, i) => h("div", { class: "grid3" },
-    h("div", {}, h("label", {}, "角色名"), field(ch, "name", h("input", { type: "text" }))),
+    h("div", { class: "stack" }, h("div", {}, h("label", {}, "角色名"), field(ch, "name", h("input", { type: "text" }))),
+      h("div", {}, h("label", {}, "配音音色（可选，台词用）"), field(ch, "voice", h("input", { type: "text", placeholder: "voice_type" })))),
     h("div", { style: "grid-column: span 2" }, h("label", { class: "row spread" }, "固定外观描述",
       dis ? null : h("button", { class: "ghost danger small", type: "button", onclick: () => { d.characters.splice(i, 1); touch(); redraw(); } }, "删除")),
       field(ch, "appearance", ta(2))))));
@@ -306,10 +307,18 @@ function scriptTab(p, busy) {
       h("div", { class: "grid3", style: "margin-top:10px" },
         h("div", {}, h("label", {}, "时长"), dur),
         h("div", {}, h("label", {}, "出场角色"), charsInput),
-        h("div", {}, h("label", {}, "旁白 / 字幕"), field(s, "narration", h("input", { type: "text" })))),
+        h("div", {}, h("label", {}, "旁白 / 台词（也作字幕）"), field(s, "narration", h("input", { type: "text" })),
+          d.characters.length ? speakerSel(s) : null)),
       i < d.shots.length - 1 ? h("label", { class: "check" }, linkBox(s),
         "平滑过渡到下一镜（用下一镜的场景图做尾帧，适合同一场景的连续动作）") : null);
   });
+  function speakerSel(s) {
+    const sel = h("select", { style: "margin-top:6px" }, h("option", { value: "" }, "说话人：画外旁白"),
+      d.characters.filter((c) => c.name).map((c) => h("option", { value: c.name, selected: s.speaker === c.name }, `说话人：${c.name}`)));
+    sel.disabled = dis;
+    sel.addEventListener("change", () => { s.speaker = sel.value; touch(); });
+    return sel;
+  }
   function linkBox(s) {
     const cb = h("input", { type: "checkbox", checked: !!s.link_next, disabled: dis });
     cb.addEventListener("change", () => { s.link_next = cb.checked; touch(); });
@@ -453,11 +462,19 @@ function finalTab(p, busy) {
   const ttsOn = h("input", { type: "checkbox", checked: S.cfg.tts.enabled && hasNarr, disabled: !S.cfg.tts.enabled || !hasNarr || busy });
   const voice = h("input", { type: "text", value: S.cfg.tts.voice, disabled: !S.cfg.tts.enabled || busy, placeholder: "音色 voice_type" });
   const meta = p.final_meta;
-  const compose = () => startJob("compose", { bgm: p.has_bgm, tts: ttsOn.checked, voice: voice.value.trim() });
+  const burn = h("input", { type: "checkbox", checked: meta ? !!meta.burn_subs : false, disabled: !hasNarr || busy });
+  const compose = () => startJob("compose", { bgm: p.has_bgm, tts: ttsOn.checked, voice: voice.value.trim(), burn_subs: burn.checked });
+  const others = S.cfg.ratios.filter((r) => r !== p.ratio);
+  const exportPanel = p.final ? h("div", { class: "panel stack" },
+    h("h2", {}, "导出其他画幅"),
+    h("div", { class: "muted small" }, "不重新生成：原画面完整保留，空白处用同一画面放大模糊填充。适合把竖屏片发到横屏平台。"),
+    h("div", { class: "row" }, others.map((r) => p.exports && p.exports[r]
+      ? h("a", { href: p.exports[r], download: `${p.title}_${r.replace(":", "x")}.mp4` }, h("button", {}, `下载 ${r}`))
+      : h("button", { disabled: busy, onclick: () => startJob("export", { ratio: r }) }, `导出 ${r}`)))) : null;
   return h("div", {},
     h("div", { class: "panel" },
       meta && p.final ? h("div", { class: "muted small", style: "text-align:center;margin-bottom:8px" },
-        [meta.tts ? `旁白配音（${meta.voice}）` : "无配音", meta.bgm ? "含 BGM" : "无 BGM"].join(" · ")) : null,
+        [meta.tts ? `旁白配音（${meta.voice}）` : "无配音", meta.bgm ? "含 BGM" : "无 BGM", meta.burn_subs ? "字幕已烧录" : "软字幕"].join(" · ")) : null,
       p.final ? [h("video", { class: "final", src: p.final, controls: true, playsinline: true }),
         h("div", { class: "row", style: "justify-content:center;margin-top:12px" },
           h("a", { href: p.final, download: `${p.title}.mp4` }, h("button", { class: "primary" }, "下载成片")),
@@ -468,8 +485,10 @@ function finalTab(p, busy) {
       !S.cfg.tts.enabled ? h("div", { class: "muted small" }, "服务器未配置 TTS_APPID / TTS_TOKEN，旁白只作为字幕。")
         : !hasNarr ? h("div", { class: "muted small" }, "脚本里没有旁白，可在「① 脚本」里填写。")
           : h("div", { class: "muted small" }, "用火山引擎语音合成为每镜旁白配音，按镜头起点对齐；同样的文字和音色只合成一次。"),
-      h("label", { class: "check" }, ttsOn, "合成时加入旁白配音"),
+      h("label", { class: "check" }, ttsOn, "合成时加入旁白配音（设了说话人的镜头用该角色的音色）"),
+      h("label", { class: "check" }, burn, "把字幕烧进画面（抖音、视频号等平台不显示软字幕时勾选）"),
       h("div", { style: "max-width:360px" }, h("label", {}, "音色（voice_type，见火山引擎音色列表）"), voice)),
+    exportPanel,
     h("div", { class: "panel stack" },
       h("h2", {}, "背景音乐（可选）"),
       h("div", { class: "muted small" }, p.has_bgm ? "已上传 BGM，合成时混入（有配音时自动压低到 25%）" : "不上传则只有配音或无声"),

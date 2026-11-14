@@ -121,7 +121,7 @@ def test_full_web_flow(server, tmp_path):
     assert r.status_code == 400
     p = job(server, pid, "compose", tts=True, voice="zh_test_voice")
     assert p["status"] == "done" and p["final"]
-    assert p["final_meta"] == {"tts": True, "bgm": False, "voice": "zh_test_voice"}
+    assert p["final_meta"] == {"tts": True, "bgm": False, "voice": "zh_test_voice", "burn_subs": False}
     v = requests.get(server + p["final"], auth=AUTH, headers={"Range": "bytes=0-99"})
     assert v.status_code == 206 and len(v.content) == 100
     srt = requests.get(server + p["final"].replace(".mp4", ".srt"), auth=AUTH)
@@ -177,3 +177,23 @@ def test_stats(server):
     jobs = {j["kind"]: j for j in d["jobs"]}
     assert jobs["images"]["done"] == 1 and jobs["script"]["total"] == 1
     assert d["top_projects"][0]["id"] == pid
+
+
+def test_export_via_api(server):
+    r = requests.post(f"{server}/api/projects", auth=AUTH, data={"description": "导出画幅测试", "duration": "15"})
+    pid = r.json()["id"]
+    wait_idle(server, pid)
+    bad = requests.post(f"{server}/api/projects/{pid}/jobs", json={"kind": "export", "ratio": "16:9"}, auth=AUTH)
+    assert bad.status_code == 400  # 还没有成片
+    job(server, pid, "images")
+    p = wait_idle(server, pid)
+    for s in p["shots"]:
+        requests.post(f"{server}/api/projects/{pid}/select", json={"shot_id": s["id"], "candidate": 1}, auth=AUTH)
+    job(server, pid, "videos")
+    p = job(server, pid, "compose", burn_subs=True)
+    assert p["final_meta"]["burn_subs"]
+    assert requests.post(f"{server}/api/projects/{pid}/jobs", json={"kind": "export", "ratio": "2:1"},
+                         auth=AUTH).status_code == 400
+    p = job(server, pid, "export", ratio="1:1")
+    assert p["status"] == "done" and p["exports"]["1:1"].startswith(f"/files/{pid}/export_1x1_")
+    assert requests.get(server + p["exports"]["1:1"], auth=AUTH).status_code == 200

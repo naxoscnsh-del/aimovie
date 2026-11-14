@@ -186,10 +186,12 @@ class Pipeline:
             self._set_status("failed")
             raise
         self._record("script", self.s.deepseek_model, script_cost_cny(self.s, usage), usage=usage)
-        fixed = {c["name"]: c["appearance"] for c in self.p.state["brief"].get("characters") or []}
-        for c in script["characters"]:  # 模板里的角色外观以模板为准，保证跨项目一致
+        fixed = {c["name"]: c for c in self.p.state["brief"].get("characters") or []}
+        for c in script["characters"]:  # 模板里的角色外观和音色以模板为准，保证跨项目一致
             if c["name"] in fixed:
-                c["appearance"] = fixed[c["name"]]
+                c["appearance"] = fixed[c["name"]]["appearance"]
+                if fixed[c["name"]].get("voice"):
+                    c["voice"] = fixed[c["name"]]["voice"]
         self.p.write_script(script)
         self.p.state["shots"] = {s["id"]: _new_shot_state() for s in script["shots"]}
         self.p.state["final"] = None
@@ -438,20 +440,22 @@ class Pipeline:
         """为每镜旁白合成语音（按文本+音色缓存），返回 [(起始秒, 音频文件)]。"""
         tts = self.tts or VolcTTS(self.s)
         voice = voice or self.s.tts_voice
+        char_voice = {c["name"]: c["voice"] for c in self.p.script["characters"] if c.get("voice")}
         audio_dir = self.p.root / "audio"
         audio_dir.mkdir(exist_ok=True)
         tracks, t0 = [], 0.0
         for shot, length in zip(shots, clip_lengths):
             text = shot["narration"].strip()
             if text:
-                key = hashlib.sha1(f"{voice}|{text}".encode("utf-8")).hexdigest()[:12]
+                v = char_voice.get(shot.get("speaker") or "", voice)  # 角色台词用角色音色，旁白用默认音色
+                key = hashlib.sha1(f"{v}|{text}".encode("utf-8")).hexdigest()[:12]
                 path = audio_dir / f"{key}.mp3"
                 if not path.exists():
                     price = len(text) / 10000 * self.s.pricing.tts_per_10k_chars
                     self.ledger.ensure_room(price, f"第 {shot['index']} 镜配音")
                     self.log(f"TTS 第 {shot['index']} 镜：{text[:20]}")
-                    path.write_bytes(tts.synthesize(text, voice))
-                    self._record("tts", voice, price, shot=shot["index"], usage={"chars": len(text)})
+                    path.write_bytes(tts.synthesize(text, v))
+                    self._record("tts", v, price, shot=shot["index"], usage={"chars": len(text)})
                     self.p.save()
                 spoken = probe_duration(path)
                 if spoken > length + 0.3:
@@ -460,7 +464,8 @@ class Pipeline:
             t0 += length
         return tracks
 
-    def run_compose(self, bgm: str | None = None, tts: bool = False, voice: str | None = None) -> Path:
+    def run_compose(self, bgm: str | None = None, tts: bool = False, voice: str | None = None,
+                    burn_subs: bool = False) -> Path:
         shots = self.p.script["shots"]
         missing = [s["index"] for s in shots if not self.p.shot_state(s["id"])["video"]]
         if missing:
@@ -475,7 +480,7 @@ class Pipeline:
             if tts and any(s["narration"].strip() for s in shots):
                 narr = self._narration_audio(shots, [probe_duration(c) for c in clips], voice)
             out = compose(clips, [s["narration"] for s in shots], self.p.state["brief"]["ratio"],
-                          self.p.root / name, Path(bgm) if bgm else None, narration=narr)
+                          self.p.root / name, Path(bgm) if bgm else None, narration=narr, burn_subs=burn_subs)
         except Exception:
             self._set_status("shot_review")
             raise
@@ -486,10 +491,39 @@ class Pipeline:
             srt = (self.p.root / old).with_suffix(".srt")
             if srt.exists():
                 srt.unlink()
+        for f in (self.p.state.get("exports") or {}).values():  # 成片变了，旧的其他画幅版本作废
+            (self.p.root / f).unlink(missing_ok=True)
+        self.p.state["exports"] = {}
         self.p.state["final"] = name
-        self.p.state["final_meta"] = {"tts": bool(narr), "bgm": bool(bgm), "voice": voice if narr else None}
+        self.p.state["final_meta"] = {"tts": bool(narr), "bgm": bool(bgm), "voice": (voice or self.s.tts_voice) if narr else None,
+                                      "burn_subs": burn_subs}
         self._set_status("done")
         self.log(f"成片已生成：{name}" + ("（含旁白配音）" if narr else ""))
+        return out
+
+    def export_ratio(self, ratio: str) -> Path:
+        """把成片转成其他画幅：原画面完整保留，空白处用同一画面放大模糊填充。"""
+        from .compose import OUT_SIZES, reframe
+        final = self.p.state.get("final")
+        if not final:
+            raise StageError("还没有成片，先合成")
+        if ratio not in OUT_SIZES:
+            raise StageError(f"不支持的画幅 {ratio}")
+        if ratio == self.p.state["brief"]["ratio"]:
+            raise StageError("和原画幅相同，直接下载成片即可")
+        prev = self.p.state["status"]
+        self._set_status("rendering")
+        name = f"export_{ratio.replace(':', 'x')}_{uuid.uuid4().hex[:4]}.mp4"
+        try:
+            out = reframe(self.p.root / final, self.p.root / name, ratio)
+        finally:
+            self._set_status(prev if prev != "rendering" else "done")
+        exports = self.p.state.setdefault("exports", {})
+        if exports.get(ratio):
+            (self.p.root / exports[ratio]).unlink(missing_ok=True)
+        exports[ratio] = name
+        self.p.save()
+        self.log(f"已导出 {ratio} 版本：{name}")
         return out
 
     def run_all(self, bgm: str | None = None) -> Path:

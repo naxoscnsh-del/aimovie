@@ -193,6 +193,7 @@ def create_app(settings: Settings | None = None, data_dir: Path | None = None,
         out["brief"] = {**st["brief"], "refs": [furl(p, r) for r in st["brief"]["refs"]]}
         out["has_bgm"] = bool(st.get("bgm"))
         out["final_meta"] = st.get("final_meta")
+        out["exports"] = {r: furl(p, f) for r, f in (st.get("exports") or {}).items()}
         last = store.latest(st["id"])
         out["last_job"] = last
         out["script"] = None
@@ -408,7 +409,14 @@ def create_app(settings: Settings | None = None, data_dir: Path | None = None,
                     return err("缺少 shot / candidate")
                 if not 2 <= len(args["instruction"]) <= 300:
                     return err("修改说明 2–300 字")
+            if kind == "export":
+                if body.get("ratio") not in RATIO_SIZES:
+                    return err("不支持的画幅")
+                if not p.state.get("final"):
+                    return err("还没有成片，先合成")
+                args = {"ratio": body["ratio"]}
             if kind == "compose":
+                args["burn_subs"] = bool(body.get("burn_subs"))
                 if body.get("bgm") and p.state.get("bgm"):
                     args["bgm"] = p.state["bgm"]
                 if body.get("tts"):
