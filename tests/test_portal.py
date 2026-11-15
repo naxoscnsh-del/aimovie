@@ -25,7 +25,7 @@ class Resp:
 class FakeHRBP:
     def __init__(self):
         self.calls = 0
-        self.reply = Resp(200, {"ok": True, "name": "小林", "pending": False})
+        self.reply = Resp(200, {"name": "小林", "email": "lin@x", "systems": [{"key": "site-movie"}]})
 
     def get(self, url, headers=None, timeout=0):
         self.calls += 1
@@ -60,10 +60,13 @@ def test_portal_rejects_and_admin(tmp_path):
     hr.reply = Resp(401)
     c.cookies.set("ni_portal", cookie("u1"))
     assert c.get("/movie/api/projects").status_code == 401
-    hr.reply = Resp(200, {"ok": True, "name": "小林", "pending": True})
+    hr.reply = Resp(200, {"name": "小林", "pending": True})
     assert c.get("/movie/api/projects").status_code == 401
-    hr.reply = Resp(200, {"ok": True, "name": "小林", "pending": False})
-    assert c.get("/movie/api/config").json()["role"] == "admin"
+    hr.reply = Resp(200, {"name": "小林", "email": "lin@x", "systems": [{"key": "site-movie"}]})
+    assert c.get("/movie/api/config").json()["role"] == "admin"  # Cookie 里有 uid=u1，优先用它
+    c2, hr2 = make(tmp_path, admins={"lin@x"})
+    c2.cookies.set("ni_portal", "opaque-no-uid")
+    assert c2.get("/movie/api/config").json()["role"] == "admin"
 
 
 def test_portal_upstream_down(tmp_path):
@@ -80,3 +83,11 @@ def test_portal_debug(tmp_path):
     c.cookies.set("ni_portal", cookie("u1"))
     d = c.get("/movie/auth/debug").json()
     assert d["has_cookie"] and d["hrbp_status"] == 200 and d["name"] == "小林" and "sig" not in str(d)
+
+
+def test_portal_not_opened(tmp_path):
+    c, hr = make(tmp_path)
+    hr.reply = Resp(200, {"name": "小林", "systems": [{"key": "site-arap"}]})
+    c.cookies.set("ni_portal", cookie("u1"))
+    r = c.get("/movie/api/projects")
+    assert r.status_code == 403 and "AI视频" in r.text

@@ -36,7 +36,7 @@ from videogen.pipeline import Pipeline, Project, StageError
 from videogen.script import ScriptError
 
 from .jobs import JobStore, ProjectBusy, Runner, default_factory
-from .portal import PortalAuth, PortalConfig, PortalError
+from .portal import PortalAuth, PortalConfig, PortalDenied, PortalError
 from .oidc import OIDC, SESSION_COOKIE, STATE_COOKIE, OIDCConfig, OIDCError
 from .team import ASSET_KINDS, TeamError, TeamStore
 
@@ -145,7 +145,9 @@ class Auth(BaseHTTPMiddleware):
             else:
                 sess = self.oidc.read_session(request.cookies.get(SESSION_COOKIE))
         except PortalError as e:
-            return Response(f"登录服务暂不可用：{e}", status_code=503, media_type="text/plain; charset=utf-8")
+            code = 403 if isinstance(e, PortalDenied) else 503
+            return Response(str(e) if code == 403 else f"登录服务暂不可用：{e}", status_code=code,
+                            media_type="text/plain; charset=utf-8")
         if not sess:
             login = f"{self.base}/auth/login"
             if path.startswith(("/api/", "/files/", "/library/")):
@@ -629,7 +631,9 @@ def create_app(settings: Settings | None = None, data_dir: Path | None = None,
                 if await run_in_threadpool(oidc.identify, req.cookies):
                     return RedirectResponse(f"{base}{nxt}", status_code=302)
             except PortalError as e:
-                return Response(f"登录服务暂不可用：{e}", status_code=503, media_type="text/plain; charset=utf-8")
+                code = 403 if isinstance(e, PortalDenied) else 503
+                return Response(str(e) if code == 403 else f"登录服务暂不可用：{e}", status_code=code,
+                                media_type="text/plain; charset=utf-8")
             return RedirectResponse(oidc.login_url, status_code=302)  # 门户登录后，从门户首页进入本系统
         try:
             state, nonce, verifier, cookie = oidc.new_state(nxt)

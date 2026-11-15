@@ -27,6 +27,13 @@ class PortalError(RuntimeError):
     pass
 
 
+class PortalDenied(PortalError):
+    """门户登录有效，但没有开通本系统。"""
+
+
+SYSTEM_KEY = "site-movie"
+
+
 @dataclass
 class PortalConfig:
     hrbp_base_url: str
@@ -80,7 +87,7 @@ class PortalAuth:
                 out["hrbp_status"] = r.status_code
                 try:
                     d = r.json()
-                    out["hrbp_ok"], out["hrbp_pending"], out["name"] = d.get("ok"), d.get("pending"), d.get("name")
+                    out["name"], out["has_movie"] = d.get("name"), any(isinstance(x, dict) and x.get("key") == SYSTEM_KEY for x in d.get("systems") or [])
                 except ValueError:
                     out["hrbp_body"] = r.text[:120]
             except requests.RequestException as e:
@@ -95,9 +102,7 @@ class PortalAuth:
         hit = self._cache.get(token)
         if hit and hit[0] > time.time():
             return hit[1]
-        uid = _uid_of(token)
-        if not uid:
-            return None
+        uid = _uid_of(token)  # 可能为空：生产 Cookie 载荷里没有 uid
         try:
             r = self.http.get(f"{self.cfg.hrbp_base_url}/api/portal/session",
                               headers={"Cookie": f"{PORTAL_COOKIE}={token}"}, timeout=8)
@@ -109,10 +114,15 @@ class PortalAuth:
         if r.status_code != 200:
             raise PortalError(f"HRBP 返回 HTTP {r.status_code}")
         data = r.json()
-        if not data.get("ok") or data.get("pending"):
-            log.warning("HRBP 会话不可用：ok=%s pending=%s", data.get("ok"), data.get("pending"))  # pending：账号申请还没通过
+        # 生产的会话接口形如 {name, email, systems:[{key,...}]}，没有 ok / 账号 ID；有 ok 或 pending 字段时照旧判断
+        if data.get("ok") is False or data.get("pending") or not data.get("name"):
+            log.warning("HRBP 会话不可用：ok=%s pending=%s name=%s", data.get("ok"), data.get("pending"), bool(data.get("name")))
             return None
-        user = {"sub": uid, "name": str(data.get("name") or uid)[:40], "email": ""}
+        systems = data.get("systems")
+        if isinstance(systems, list) and not any(isinstance(x, dict) and x.get("key") == SYSTEM_KEY for x in systems):
+            raise PortalDenied("你的账号还没有开通「AI视频」，请联系管理员在用户权限里开通")
+        sub = str(data.get("id") or data.get("userId") or data.get("uid") or uid or data.get("email") or data["name"])
+        user = {"sub": sub, "name": str(data["name"])[:40], "email": str(data.get("email") or "")}
         if len(self._cache) > 500:
             self._cache.clear()
         self._cache[token] = (time.time() + self.cfg.cache_seconds, user)
