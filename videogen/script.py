@@ -8,10 +8,18 @@ import uuid
 from .config import Settings
 from .http import HttpClient
 
-SYSTEM_PROMPT = """你是短视频编剧兼分镜师。根据用户的场景描述，写一个可直接用于 AI 生成的分镜脚本。
+# 可编辑部分：团队在「写作提示词」页按需调整（人设、风格、写法偏好）
+DEFAULT_GUIDE = """你是短视频编剧兼分镜师。根据用户的场景描述，写一个可直接用于 AI 生成的分镜脚本。
 生成流程是：先用文生图模型为每个镜头画一张"场景图"（视频首帧），再用图生视频模型让这张图动起来。
 
-只输出 JSON，格式如下：
+创作要求：
+- 每个镜头只表达一个清晰的动作，避免复杂多人互动和画面内文字。
+- 用户提供了参考图时，提示词要与参考图的主体保持一致。
+- 镜头之间节奏有变化：开场建立环境，中间推进情节，结尾落在一个有记忆点的画面。
+- 画风、色调、镜头语言要统一，贴合场景描述里的情绪。"""
+
+# 固定部分：输出格式与流水线依赖的硬约束，不开放编辑，始终拼在可编辑部分之后
+FORMAT_PROMPT = """只输出 JSON，格式如下：
 {
   "title": "短片标题",
   "style": "全片统一的画风与色调描述，会拼接到每一张场景图提示词前面，例如：电影感写实摄影，暖色调，浅景深，35mm",
@@ -32,15 +40,21 @@ SYSTEM_PROMPT = """你是短视频编剧兼分镜师。根据用户的场景描�
   ]
 }
 
-要求：
+必须遵守：
 - 镜头时长只能从这些值中选：{durations} 秒；所有镜头时长之和尽量接近目标总时长。
 - 画幅：{ratio}。构图要适合这个画幅。
 - 同一角色在每个镜头的外观必须一致，外观只在 characters 里定义，image_prompt 里用角色名指代。
-- 每个镜头只表达一个清晰的动作，避免复杂多人互动和画面内文字。
-- 用户提供了参考图时，提示词要与参考图的主体保持一致。
 - link_next：这一镜和下一镜是同一场景里连续的动作（例如人物从门口走到吧台）时填 true，视频会从本镜画面平滑过渡到下一镜画面；换场景、跳切时填 false。最后一镜必须是 false。
-- 旁白每镜不超过（时长 × 4）个字，保证念得完。
-"""
+- 旁白每镜不超过（时长 × 4）个字，保证念得完。"""
+
+SYSTEM_PROMPT = DEFAULT_GUIDE + "\n\n" + FORMAT_PROMPT  # 兼容旧引用
+GUIDE_MAX = 4000
+
+
+def system_prompt(guide: str | None, durations: list[int], ratio: str) -> str:
+    g = (guide or "").strip() or DEFAULT_GUIDE
+    fixed = FORMAT_PROMPT.replace("{durations}", "、".join(map(str, durations))).replace("{ratio}", ratio)
+    return g + "\n\n" + fixed
 
 
 VOICE_RE = re.compile(r"[A-Za-z0-9_.-]{2,64}")
@@ -132,8 +146,7 @@ def generate_script(settings: Settings, brief: dict, client: HttpClient | None =
                     max_attempts: int = 3) -> tuple[dict, dict]:
     """返回 (脚本, usage)。JSON 不合规时把错误反馈给模型重试。"""
     client = client or HttpClient(settings.deepseek_base_url, settings.deepseek_api_key)
-    system = SYSTEM_PROMPT.replace("{durations}", "、".join(map(str, settings.seedance_durations))) \
-                          .replace("{ratio}", brief.get("ratio", "9:16"))
+    system = system_prompt(brief.get("guide"), settings.seedance_durations, brief.get("ratio", "9:16"))
     messages = [{"role": "system", "content": system},
                 {"role": "user", "content": build_user_prompt(brief)}]
     usage_total = {"prompt_tokens": 0, "completion_tokens": 0}

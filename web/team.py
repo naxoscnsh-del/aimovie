@@ -56,11 +56,20 @@ class TeamStore:
             CREATE TABLE IF NOT EXISTS sso_users (
                 sub TEXT PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL DEFAULT '',
                 role TEXT NOT NULL DEFAULT 'member', first_seen REAL NOT NULL, last_seen REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS prompts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, content TEXT NOT NULL,
+                builtin INTEGER NOT NULL DEFAULT 0, owner TEXT NOT NULL DEFAULT '',
+                updated_by TEXT NOT NULL DEFAULT '', updated REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS prompt_versions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, prompt_id INTEGER NOT NULL, content TEXT NOT NULL,
+                by TEXT NOT NULL DEFAULT '', at REAL NOT NULL);
             CREATE TABLE IF NOT EXISTS assets (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, kind TEXT NOT NULL,
                 file TEXT NOT NULL, owner TEXT NOT NULL DEFAULT '', source TEXT NOT NULL DEFAULT '',
                 created REAL NOT NULL);
             """)
+            if "prompt_id" not in {r["name"] for r in self.conn.execute("PRAGMA table_info(templates)")}:
+                self.conn.execute("ALTER TABLE templates ADD COLUMN prompt_id INTEGER")  # 风格组合绑定的写作提示词
             self.conn.commit()
 
     # ---------- 成员 ----------
@@ -141,6 +150,10 @@ class TeamStore:
         """登录时记录成员，返回库里保存的角色。"""
         now = time.time()
         with self.lock:
+            # 账号标识从邮箱换成稳定 ID（HRBP 会话接口开始返回 id）时，把原来按邮箱记的成员和角色并过来
+            if email and sub != email and self.conn.execute("SELECT 1 FROM sso_users WHERE sub=?", (email,)).fetchone() \
+                    and not self.conn.execute("SELECT 1 FROM sso_users WHERE sub=?", (sub,)).fetchone():
+                self.conn.execute("UPDATE sso_users SET sub=? WHERE sub=?", (sub, email))
             self.conn.execute(
                 "INSERT INTO sso_users(sub, name, email, first_seen, last_seen) VALUES (?,?,?,?,?) "
                 "ON CONFLICT(sub) DO UPDATE SET name=excluded.name, email=excluded.email, last_seen=excluded.last_seen",
@@ -201,16 +214,20 @@ class TeamStore:
             duration = int(data.get("duration", 30))
         except (TypeError, ValueError):
             raise TeamError("时长必须是数字")
+        prompt_id = None
+        if data.get("prompt_id"):
+            row = self.get_prompt(int(data["prompt_id"]))
+            prompt_id = row["id"] if row else None
         with self.lock:
             cur = self.conn.execute(
-                "INSERT INTO templates(name, description, style, ratio, duration, characters, asset_ids, owner, created) "
-                "VALUES (?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO templates(name, description, style, ratio, duration, characters, asset_ids, owner, created, prompt_id) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (name, str(data.get("description", "")).strip()[:500], str(data.get("style", "")).strip()[:300],
                  str(data.get("ratio", "9:16")), duration,
                  json.dumps([{"name": c["name"][:20], "appearance": c["appearance"][:300],
                               **({"voice": c["voice"]} if re.fullmatch(r"[A-Za-z0-9_.-]{2,64}", str(c.get("voice") or ""))
                                  else {})} for c in chars], ensure_ascii=False),
-                 json.dumps(asset_ids), owner, time.time()))
+                 json.dumps(asset_ids), owner, time.time(), prompt_id))
             self.conn.commit()
         return self.get_template(cur.lastrowid)
 
@@ -256,3 +273,98 @@ class TeamStore:
         f = self.library / a["file"]
         if f.exists():
             f.unlink()
+
+    # ---------- 写作提示词 ----------
+    DEFAULT_PROMPT_NAME = "默认"
+
+    def ensure_default_prompt(self) -> None:
+        from videogen.script import DEFAULT_GUIDE
+        with self.lock:
+            if not self.conn.execute("SELECT 1 FROM prompts WHERE builtin=1").fetchone():
+                cur = self.conn.execute(
+                    "INSERT OR IGNORE INTO prompts(name, content, builtin, owner, updated_by, updated) VALUES (?,?,1,'系统','系统',?)",
+                    (self.DEFAULT_PROMPT_NAME, DEFAULT_GUIDE, time.time()))
+                if cur.rowcount:
+                    self.conn.execute("INSERT INTO prompt_versions(prompt_id, content, by, at) VALUES (?,?,?,?)",
+                                      (cur.lastrowid, DEFAULT_GUIDE, "系统", time.time()))
+                self.conn.commit()
+
+    def _prompt_row(self, r) -> dict:
+        return {"id": r["id"], "name": r["name"], "content": r["content"], "builtin": bool(r["builtin"]),
+                "owner": r["owner"], "updated_by": r["updated_by"], "updated": r["updated"]}
+
+    def list_prompts(self) -> list[dict]:
+        self.ensure_default_prompt()
+        with self.lock:
+            rows = self.conn.execute("SELECT * FROM prompts ORDER BY builtin DESC, id").fetchall()
+        return [self._prompt_row(r) for r in rows]
+
+    def get_prompt(self, pid: int) -> dict | None:
+        self.ensure_default_prompt()
+        with self.lock:
+            r = self.conn.execute("SELECT * FROM prompts WHERE id=?", (pid,)).fetchone()
+        return self._prompt_row(r) if r else None
+
+    def _check_prompt(self, name: str, content: str) -> tuple[str, str]:
+        from videogen.script import GUIDE_MAX
+        name, content = name.strip(), content.strip()
+        if not 1 <= len(name) <= 30:
+            raise TeamError("名称 1–30 字")
+        if not 20 <= len(content) <= GUIDE_MAX:
+            raise TeamError(f"提示词内容 20–{GUIDE_MAX} 字")
+        return name, content
+
+    def _add_version(self, pid: int, content: str, by: str) -> None:
+        self.conn.execute("INSERT INTO prompt_versions(prompt_id, content, by, at) VALUES (?,?,?,?)",
+                          (pid, content, by, time.time()))
+        self.conn.execute("DELETE FROM prompt_versions WHERE prompt_id=? AND id NOT IN "
+                          "(SELECT id FROM prompt_versions WHERE prompt_id=? ORDER BY id DESC LIMIT 20)", (pid, pid))
+
+    def add_prompt(self, name: str, content: str, user: str) -> dict:
+        self.ensure_default_prompt()
+        name, content = self._check_prompt(name, content)
+        with self.lock:
+            try:
+                cur = self.conn.execute(
+                    "INSERT INTO prompts(name, content, owner, updated_by, updated) VALUES (?,?,?,?,?)",
+                    (name, content, user, user, time.time()))
+            except sqlite3.IntegrityError:
+                raise TeamError("已有同名提示词") from None
+            self._add_version(cur.lastrowid, content, user)
+            self.conn.commit()
+        return self.get_prompt(cur.lastrowid)
+
+    def update_prompt(self, pid: int, name: str | None, content: str, user: str) -> dict:
+        cur_row = self.get_prompt(pid)
+        if not cur_row:
+            raise TeamError("提示词不存在")
+        name, content = self._check_prompt(name if name is not None else cur_row["name"], content)
+        if cur_row["builtin"]:
+            name = cur_row["name"]  # 默认模板不改名
+        with self.lock:
+            try:
+                self.conn.execute("UPDATE prompts SET name=?, content=?, updated_by=?, updated=? WHERE id=?",
+                                  (name, content, user, time.time(), pid))
+            except sqlite3.IntegrityError:
+                raise TeamError("已有同名提示词") from None
+            if content != cur_row["content"]:
+                self._add_version(pid, content, user)
+            self.conn.commit()
+        return self.get_prompt(pid)
+
+    def delete_prompt(self, pid: int) -> None:
+        row = self.get_prompt(pid)
+        if not row:
+            raise TeamError("提示词不存在")
+        if row["builtin"]:
+            raise TeamError("默认提示词不能删除，可以恢复为系统默认内容")
+        with self.lock:
+            self.conn.execute("DELETE FROM prompts WHERE id=?", (pid,))
+            self.conn.execute("DELETE FROM prompt_versions WHERE prompt_id=?", (pid,))
+            self.conn.commit()
+
+    def prompt_versions(self, pid: int) -> list[dict]:
+        with self.lock:
+            rows = self.conn.execute("SELECT id, content, by, at FROM prompt_versions WHERE prompt_id=? ORDER BY id DESC",
+                                     (pid,)).fetchall()
+        return [dict(r) for r in rows]

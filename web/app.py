@@ -99,6 +99,7 @@ class Auth(BaseHTTPMiddleware):
         self.password = password
         self.oidc = oidc
         self.base = base
+        self._touched: dict[str, float] = {}
 
     async def dispatch(self, request: Request, call_next):
         if request.method not in SAFE_METHODS and is_cross_site(request):
@@ -156,7 +157,13 @@ class Auth(BaseHTTPMiddleware):
                 return JSONResponse({"error": "登录已过期，请重新登录", "login": login}, status_code=401)
             from urllib.parse import quote
             return RedirectResponse(f"{login}?next={quote(path or '/')}", status_code=302)
-        role = "admin" if sess["sub"] in self.oidc.cfg.admins or sess["name"] in self.oidc.cfg.admins \
+        admins = self.oidc.cfg.admins
+        if getattr(self.oidc, "is_portal", False):  # 门户模式没有登录回调，在这里记录成员（5 分钟一次）
+            now = time.time()
+            if now - self._touched.get(sess["sub"], 0) > 300:
+                self._touched[sess["sub"]] = now
+                await run_in_threadpool(self.team.sso_touch, sess["sub"], sess["name"], sess.get("email", ""))
+        role = "admin" if {sess["sub"], sess["name"], sess.get("email", "")} & admins \
             else await run_in_threadpool(self.team.sso_role, sess["sub"])
         request.state.user, request.state.role, request.state.sub = sess["name"], role, sess["sub"]
         return await call_next(request)
@@ -326,6 +333,18 @@ def create_app(settings: Settings | None = None, data_dir: Path | None = None,
                     continue
         return JSONResponse(items)
 
+    def attach_guide(p: Project) -> None:
+        """把写作提示词的当前内容写进 brief（脚本生成时读取）；提示词被删除则退回默认。"""
+        b = p.state["brief"]
+        row = team.get_prompt(int(b["prompt_id"])) if b.get("prompt_id") else None
+        if row:
+            b["guide"], b["prompt_name"] = row["content"], row["name"]
+        else:
+            b.pop("guide", None)
+            b["prompt_name"] = team.DEFAULT_PROMPT_NAME
+            b.pop("prompt_id", None)
+        p.save()
+
     async def create_project(req: Request):
         form = await req.form()
         desc = str(form.get("description", "")).strip()
@@ -367,6 +386,17 @@ def create_app(settings: Settings | None = None, data_dir: Path | None = None,
             ensure_team_budget()
         except ProjectBusy as e:
             return err(str(e), 409)
+        prompt = None
+        raw_prompt = str(form.get("prompt_id", "")).strip()
+        if raw_prompt:
+            try:
+                prompt = await run_in_threadpool(team.get_prompt, int(raw_prompt))
+            except ValueError:
+                prompt = None
+            if not prompt:
+                return err("写作提示词不存在")
+        elif tpl and tpl.get("prompt_id"):  # 没单独指定时，用风格组合绑定的提示词
+            prompt = await run_in_threadpool(team.get_prompt, tpl["prompt_id"])
         style = str(form.get("style", "")).strip() or (tpl["style"] if tpl else "")
         with tempfile.TemporaryDirectory() as tmp:
             paths = [str(team.library / a_["file"]) for a_ in assets]
@@ -381,6 +411,9 @@ def create_app(settings: Settings | None = None, data_dir: Path | None = None,
             p.state["brief"]["template"] = {"id": tpl["id"], "name": tpl["name"]}
         if assets:
             p.state["brief"]["assets"] = [{"id": a_["id"], "name": a_["name"], "kind": a_["kind"]} for a_ in assets]
+        if prompt:
+            p.state["brief"]["prompt_id"] = prompt["id"]
+        await run_in_threadpool(attach_guide, p)
         p.save()
         store.enqueue(p.state["id"], "script", user=user_of(req))
         return JSONResponse(view(p, req=req), status_code=201)
@@ -509,6 +542,8 @@ def create_app(settings: Settings | None = None, data_dir: Path | None = None,
                 args["shots"] = shots
             if kind != "script" and not p.has_script:
                 return err("还没有脚本")
+            if kind == "script":
+                await run_in_threadpool(attach_guide, p)  # 重新生成脚本时用提示词的最新内容
             if kind == "refine":
                 try:
                     args = {"shot": int(body["shot"]), "candidate": int(body["candidate"]),
@@ -717,7 +752,7 @@ def create_app(settings: Settings | None = None, data_dir: Path | None = None,
             return err("只有管理员可以查看", 403)
         items = await run_in_threadpool(team.sso_list)
         for u in items:
-            u["fixed_admin"] = u["sub"] in oidc.cfg.admins or u["name"] in oidc.cfg.admins
+            u["fixed_admin"] = bool({u["sub"], u["name"], u["email"]} & oidc.cfg.admins)
             if u["fixed_admin"]:
                 u["role"] = "admin"
         return JSONResponse(items)
@@ -775,7 +810,9 @@ def create_app(settings: Settings | None = None, data_dir: Path | None = None,
     # ---------- 模板 ----------
     def tpl_view(tp: dict) -> dict:
         assets = [team.get_asset(i) for i in tp["asset_ids"]]
-        return {**tp, "assets": [{"id": x["id"], "name": x["name"], "url": f"{base}/library/{x['file']}"} for x in assets if x]}
+        pr = team.get_prompt(tp["prompt_id"]) if tp.get("prompt_id") else None
+        return {**tp, "prompt_name": pr["name"] if pr else "",
+                "assets": [{"id": x["id"], "name": x["name"], "url": f"{base}/library/{x['file']}"} for x in assets if x]}
 
     async def list_templates(_req):
         return JSONResponse([tpl_view(x) for x in team.list_templates()])
@@ -789,7 +826,8 @@ def create_app(settings: Settings | None = None, data_dir: Path | None = None,
                 b = p.state["brief"]
                 body = {"name": body.get("name") or sc["title"], "description": b["description"],
                         "style": sc["style"], "ratio": b["ratio"], "duration": b["duration"],
-                        "characters": sc["characters"], "asset_ids": [x["id"] for x in b.get("assets", [])]}
+                        "characters": sc["characters"], "asset_ids": [x["id"] for x in b.get("assets", [])],
+                        "prompt_id": b.get("prompt_id")}
             tp = team.add_template(body, user_of(req))
             return JSONResponse(tpl_view(tp), status_code=201)
         except LookupError:
@@ -805,6 +843,45 @@ def create_app(settings: Settings | None = None, data_dir: Path | None = None,
             return err("只能删除自己创建的模板", 403)
         team.delete_template(tp["id"])
         return JSONResponse({"ok": True})
+
+    # ---------- 写作提示词 ----------
+    async def list_prompts(_req):
+        from videogen.script import DEFAULT_GUIDE, FORMAT_PROMPT, GUIDE_MAX
+        items = await run_in_threadpool(team.list_prompts)
+        fixed = FORMAT_PROMPT.replace("{durations}", "、".join(map(str, s.seedance_durations))).replace("{ratio}", "（所选画幅）")
+        return JSONResponse({"items": items, "default_content": DEFAULT_GUIDE, "fixed": fixed, "max": GUIDE_MAX})
+
+    async def add_prompt(req: Request):
+        body = await req.json()
+        try:
+            row = await run_in_threadpool(team.add_prompt, str(body.get("name", "")), str(body.get("content", "")), user_of(req))
+        except TeamError as e:
+            return err(str(e))
+        return JSONResponse(row, status_code=201)
+
+    async def update_prompt(req: Request):
+        body = await req.json()
+        try:
+            row = await run_in_threadpool(team.update_prompt, req.path_params["pid"], body.get("name"),
+                                          str(body.get("content", "")), user_of(req))
+        except TeamError as e:
+            return err(str(e), 404 if "不存在" in str(e) else 400)
+        return JSONResponse(row)
+
+    async def delete_prompt(req: Request):
+        row = await run_in_threadpool(team.get_prompt, req.path_params["pid"])
+        if not row:
+            return err("提示词不存在", 404)
+        if not (is_admin(req) or row["owner"] in ("", user_of(req))):
+            return err("只能删除自己创建的提示词", 403)
+        try:
+            await run_in_threadpool(team.delete_prompt, row["id"])
+        except TeamError as e:
+            return err(str(e))
+        return JSONResponse({"ok": True})
+
+    async def prompt_versions(req: Request):
+        return JSONResponse(await run_in_threadpool(team.prompt_versions, req.path_params["pid"]))
 
     # ---------- 素材库 ----------
     def asset_view(x: dict) -> dict:
@@ -979,6 +1056,11 @@ def create_app(settings: Settings | None = None, data_dir: Path | None = None,
         Route("/api/users", list_users, methods=["GET"]),
         Route("/api/users", add_user, methods=["POST"]),
         Route("/api/users/{name}", update_user, methods=["PATCH"]),
+        Route("/api/prompts", list_prompts, methods=["GET"]),
+        Route("/api/prompts", add_prompt, methods=["POST"]),
+        Route("/api/prompts/{pid:int}", update_prompt, methods=["PUT"]),
+        Route("/api/prompts/{pid:int}", delete_prompt, methods=["DELETE"]),
+        Route("/api/prompts/{pid:int}/versions", prompt_versions, methods=["GET"]),
         Route("/api/templates", list_templates, methods=["GET"]),
         Route("/api/templates", add_template, methods=["POST"]),
         Route("/api/templates/{tid:int}", delete_template, methods=["DELETE"]),

@@ -43,7 +43,7 @@ function parseRoute() {
   const h = location.hash.replace(/^#/, "") || "/";
   let m;
   if ((m = h.match(/^\/p\/([\w-]+)/))) return { name: "project", params: { id: m[1] } };
-  const map = { "/": "overview", "/list": "list", "/new": "new", "/templates": "templates", "/library": "library", "/stats": "stats",
+  const map = { "/": "overview", "/list": "list", "/new": "new", "/templates": "templates", "/prompts": "prompts", "/library": "library", "/stats": "stats",
     "/members": "members", "/system": "system" };
   return { name: map[h.split("?")[0]] || "overview", params: {} };
 }
@@ -77,8 +77,8 @@ const DataTable = {
 const NewPage = {
   components: { Chips, PageHead },
   setup() {
-    const f = reactive({ description: "", style: "", ratio: "9:16", duration: 30, template: "" });
-    const templates = ref([]), assets = ref([]), picked = ref(new Set()), files = ref([]), busy = ref(false);
+    const f = reactive({ description: "", style: "", ratio: "9:16", duration: 30, template: "", prompt: "" });
+    const templates = ref([]), assets = ref([]), prompts = ref([]), picked = ref(new Set()), files = ref([]), busy = ref(false);
     const tpl = computed(() => templates.value.find((t) => String(t.id) === String(f.template)) || null);
     const tplAssetIds = computed(() => new Set(tpl.value ? tpl.value.asset_ids : []));
     const previews = computed(() => files.value.map((x) => ({ name: x.name, url: URL.createObjectURL(x) })));
@@ -91,9 +91,14 @@ const NewPage = {
     watch(tpl, (t) => {
       if (!t) return;
       f.ratio = t.ratio; if ([15, 30, 45, 60].includes(t.duration)) f.duration = t.duration; f.style = t.style;
+      if (t.prompt_id) f.prompt = String(t.prompt_id);
     });
     onMounted(async () => {
-      try { [templates.value, assets.value] = await Promise.all([api("/api/templates"), api("/api/assets")]); } catch (e) { fail(e); }
+      try {
+        let pr;
+        [templates.value, assets.value, pr] = await Promise.all([api("/api/templates"), api("/api/assets"), api("/api/prompts")]);
+        prompts.value = pr.items;
+      } catch (e) { fail(e); }
       if (store.pendingTemplate) { f.template = String(store.pendingTemplate); store.pendingTemplate = null; }
     });
     const toggle = (a) => {
@@ -108,21 +113,23 @@ const NewPage = {
       fd.set("ratio", f.ratio); fd.set("duration", f.duration);
       files.value.forEach((x) => fd.append("refs", x));
       if (tpl.value) fd.set("template_id", tpl.value.id);
+      if (f.prompt) fd.set("prompt_id", f.prompt);
       if (picked.value.size) fd.set("asset_ids", [...picked.value].join(","));
       busy.value = true;
       try { const p = await api("/api/projects", { method: "POST", form: fd }); go(`#/p/${p.id}`); }
       catch (e) { fail(e); busy.value = false; }
     }
-    return { f, templates, assets, picked, tpl, tplAssetIds, previews, warn, toggle, onFiles, submit, busy, cfg: store.cfg };
+    return { f, templates, prompts, assets, picked, tpl, tplAssetIds, previews, warn, toggle, onFiles, submit, busy, cfg: store.cfg };
   },
   template: `<div class="page">
     <PageHead title="新建短片" sub="描述场景，系统先写分镜脚本，确认后再出图、生成视频" />
     <div class="panel stack">
       <div v-if="warn" class="warnline">{{ warn }}</div>
       <div v-if="templates.length" class="grid2">
-        <div><label>风格模板</label><select v-model="f.template"><option value="">不使用模板</option>
+        <div><label>风格组合</label><select v-model="f.template"><option value="">不使用风格组合</option>
           <option v-for="t in templates" :key="t.id" :value="String(t.id)">{{ t.name }}</option></select></div>
         <div v-if="tpl" class="muted small" style="align-self:end">
+          <div v-if="tpl.prompt_name">写作提示词：{{ tpl.prompt_name }}</div>
           <div v-if="tpl.characters.length">固定角色：{{ tpl.characters.map(c => c.name + '（' + c.appearance + '）').join('；') }}</div>
           <div v-if="tpl.assets.length">自带素材：{{ tpl.assets.map(a => a.name).join('、') }}</div>
         </div>
@@ -134,6 +141,9 @@ const NewPage = {
         <div><label>目标时长</label><Chips :options="[15, 30, 45, 60]" v-model="f.duration" :label="d => d + ' 秒'" /></div>
       </div>
       <div><label>风格</label><input type="text" v-model="f.style" placeholder="可选，例如：日系胶片感、暖色调"></div>
+      <div v-if="prompts.length > 1"><label>写作提示词（决定脚本的写法和风格）</label><select v-model="f.prompt">
+        <option value="">默认</option><option v-for="x in prompts.filter(p => !p.builtin)" :key="x.id" :value="String(x.id)">{{ x.name }}</option></select>
+        <div class="muted small" style="margin-top:4px">在左侧菜单「写作提示词」里新建和调整</div></div>
       <div v-if="assets.length"><label>从素材库选参考图</label>
         <div class="pick-grid"><button v-for="a in assets" :key="a.id" type="button" class="pick"
           :class="{ on: picked.has(a.id) || tplAssetIds.has(a.id) }" :title="a.kind + ' · ' + a.name" @click="toggle(a)">
@@ -250,10 +260,10 @@ const ScriptTab = {
       } catch (e) { fail(e); }
     }
     async function saveTemplate() {
-      if (dirty.value) return toast("先保存脚本修改，再另存为模板", true);
-      const name = prompt("模板名称", props.p.title);
+      if (dirty.value) return toast("先保存脚本修改，再另存为风格组合", true);
+      const name = prompt("风格组合名称", props.p.title);
       if (!name) return;
-      try { await api("/api/templates", { method: "POST", body: { from_project: props.p.id, name } }); toast("已存为模板"); }
+      try { await api("/api/templates", { method: "POST", body: { from_project: props.p.id, name } }); toast("已存为风格组合"); }
       catch (e) { fail(e); }
     }
     const regen = () => { if (confirm("重新生成会覆盖当前脚本和所有素材记录，确定？")) emit("job", "script"); };
@@ -265,7 +275,7 @@ const ScriptTab = {
     <div v-else-if="draft">
       <div class="panel stack">
         <div class="row spread"><h2>整体设定</h2><div class="row"><span class="muted small">{{ draft.shots.length }} 个镜头 · 共 {{ total }} 秒</span>
-          <button class="ghost" @click="saveTemplate">另存为模板</button></div></div>
+          <button class="ghost" @click="saveTemplate">另存为风格组合</button></div></div>
         <div><label>标题</label><input type="text" v-model="draft.title" :disabled="busy"></div>
         <div><label>全片风格（拼接到每张场景图提示词前）</label><textarea v-model="draft.style" rows="2" :disabled="busy"></textarea></div>
         <div><label>角色</label>
@@ -546,7 +556,8 @@ const ProjectPage = {
           <div class="crumb"><a href="#/list">全部短片</a> / {{ p.title }}</div>
           <div class="row" style="margin-top:4px"><h1>{{ p.title }}</h1><Badge :map="P_STATUS" :value="p.status" /></div>
           <div class="muted small" style="margin-top:4px">{{ p.ratio }} · 约 {{ p.brief.duration }} 秒<span v-if="p.owner"> · {{ p.owner }}</span>
-            <span v-if="p.brief.template"> · 模板「{{ p.brief.template.name }}」</span></div>
+            <span v-if="p.brief.template"> · 风格组合「{{ p.brief.template.name }}」</span>
+            <span v-if="p.brief.prompt_name && p.brief.prompt_name !== '默认'"> · 提示词「{{ p.brief.prompt_name }}」</span></div>
         </div>
         <div class="cost-box">
           <div class="row spread small"><span>已花 {{ usd(p.cost.spent_usd) }}</span><span class="muted">上限 {{ usd(p.cost.budget_usd) }}</span></div>
@@ -560,7 +571,7 @@ const ProjectPage = {
       <details class="brief"><summary>需求与参考图</summary><p>{{ p.brief.description }}</p>
         <p v-if="p.brief.style" class="muted small">风格：{{ p.brief.style }}</p>
         <div class="refs"><img v-for="u in p.brief.refs" :key="u" :src="u" alt="参考图"></div></details>
-      <div v-if="!p.can_edit" class="banner"><div>只读：这是 {{ p.owner }} 的项目，只有本人或管理员可以修改。可以复制、另存为模板或把场景图存入素材库。</div></div>
+      <div v-if="!p.can_edit" class="banner"><div>只读：这是 {{ p.owner }} 的项目，只有本人或管理员可以修改。可以复制、另存为风格组合或把场景图存入素材库。</div></div>
       <div v-if="banner" class="banner" :class="{ bad: banner.status === 'failed' }">
         <div v-if="banner.status !== 'failed'" class="spin"></div>
         <div class="grow"><div class="row spread">
@@ -584,22 +595,92 @@ const TemplatesPage = {
     const load = async () => { try { list.value = await api("/api/templates"); } catch (e) { fail(e); list.value = []; } };
     onMounted(load);
     const mine = (x) => store.cfg.role === "admin" || !x.owner || x.owner === store.cfg.user;
-    async function del(x) { if (!confirm(`删除模板「${x.name}」？`)) return;
+    async function del(x) { if (!confirm(`删除风格组合「${x.name}」？`)) return;
       try { await api(`/api/templates/${x.id}`, { method: "DELETE" }); load(); } catch (e) { fail(e); } }
     const use = (x) => { store.pendingTemplate = x.id; go("#/new"); };
     return { list, mine, del, use };
   },
-  template: `<div class="page"><PageHead title="风格模板" sub="保存全片风格、固定角色外观与音色、画幅时长和参考素材；同系列短片套用同一模板，角色保持一致" />
+  template: `<div class="page"><PageHead title="风格组合" sub="把写作提示词、全片风格、固定角色（外观与音色）、画幅时长和参考素材存成一个组合；同系列短片套用同一个组合，写法和角色都保持一致" />
     <div v-if="list === null" class="muted">加载中…</div>
-    <div v-else-if="!list.length" class="panel empty">还没有模板。在短片的「脚本」页点“另存为模板”即可创建。</div>
+    <div v-else-if="!list.length" class="panel empty">还没有风格组合。在短片的「脚本」页点“另存为风格组合”即可创建，会连同该短片用的写作提示词一起保存。</div>
     <div v-else class="plist"><div v-for="x in list" :key="x.id" class="pcard stack">
       <div class="row spread"><strong>{{ x.name }}</strong><span class="muted small">{{ x.ratio }} · {{ x.duration }} 秒</span></div>
+      <div v-if="x.prompt_name" class="small"><span class="badge run">写作提示词</span> {{ x.prompt_name }}</div>
       <div v-if="x.style" class="small">{{ x.style }}</div>
       <div v-if="x.characters.length" class="muted small">{{ x.characters.map(c => c.name + '：' + c.appearance).join('；') }}</div>
       <div v-if="x.assets.length" class="refs"><img v-for="a in x.assets" :key="a.id" :src="a.url" :alt="a.name" :title="a.name"></div>
       <div class="row spread"><span class="muted small">{{ x.owner }}</span><div class="row">
         <button v-if="mine(x)" class="ghost danger" @click="del(x)">删除</button><button class="primary" @click="use(x)">用它新建</button></div></div>
     </div></div></div>`,
+};
+
+// ---------- 写作提示词 ----------
+const PromptsPage = {
+  components: { PageHead },
+  setup() {
+    const d = ref(null), sel = ref(null), form = reactive({ name: "", content: "" }), versions = ref([]), showVer = ref(false), busy = ref(false);
+    const cur = computed(() => d.value && d.value.items.find((x) => x.id === sel.value));
+    const dirty = computed(() => cur.value && (form.content !== cur.value.content || form.name !== cur.value.name));
+    const mine = (x) => store.cfg.role === "admin" || !x.owner || x.owner === store.cfg.user;
+    const fmt = (t) => new Date(t * 1000).toLocaleString("zh-CN", { hour12: false }).slice(5, 16);
+    function pick(id) {
+      sel.value = id; showVer.value = false;
+      const x = d.value.items.find((i) => i.id === id);
+      if (x) { form.name = x.name; form.content = x.content; }
+    }
+    async function load(keep) {
+      try { d.value = await api("/api/prompts"); pick(keep && d.value.items.some((x) => x.id === keep) ? keep : d.value.items[0].id); }
+      catch (e) { fail(e); }
+    }
+    onMounted(() => load());
+    async function save() {
+      busy.value = true;
+      try { await api(`/api/prompts/${sel.value}`, { method: "PUT", body: { name: form.name, content: form.content } }); toast("已保存"); await load(sel.value); }
+      catch (e) { fail(e); } busy.value = false;
+    }
+    async function create() {
+      const name = prompt("新提示词的名称（内容先复制当前这份，建好后再改）", (cur.value ? cur.value.name : "") + " 副本");
+      if (!name) return;
+      try { const r = await api("/api/prompts", { method: "POST", body: { name, content: form.content } }); toast("已新建"); await load(r.id); }
+      catch (e) { fail(e); }
+    }
+    async function remove() {
+      if (!confirm(`删除「${cur.value.name}」？已用它建的短片不受影响，重新生成脚本时会改用默认。`)) return;
+      try { await api(`/api/prompts/${sel.value}`, { method: "DELETE" }); toast("已删除"); await load(); } catch (e) { fail(e); }
+    }
+    const reset = () => { if (confirm("把编辑框恢复为系统默认内容？（保存后才生效）")) form.content = d.value.default_content; };
+    async function toggleVer() {
+      showVer.value = !showVer.value;
+      if (showVer.value) { try { versions.value = await api(`/api/prompts/${sel.value}/versions`); } catch (e) { fail(e); } }
+    }
+    const useVer = (v) => { form.content = v.content; toast("已载入该版本，保存后生效"); };
+    return { d, sel, cur, form, dirty, versions, showVer, busy, mine, fmt, pick, save, create, remove, reset, toggleVer, useVer };
+  },
+  template: `<div class="page"><PageHead title="写作提示词" sub="决定 DeepSeek 怎么写脚本：人设、风格、写法偏好。新建短片时可以选用；输出格式由系统固定，改不坏" />
+    <div v-if="!d" class="muted">加载中…</div>
+    <div v-else class="prompt-layout">
+      <div class="panel prompt-list">
+        <button v-for="x in d.items" :key="x.id" class="prompt-item" :class="{ on: x.id === sel }" @click="pick(x.id)">
+          <strong>{{ x.name }}</strong><span class="muted small">{{ x.builtin ? '系统默认' : x.owner }} · {{ fmt(x.updated) }}</span></button>
+      </div>
+      <div class="stack" v-if="cur">
+        <div class="panel stack">
+          <div class="grid2"><div><label>名称</label><input type="text" v-model="form.name" :disabled="cur.builtin"></div>
+            <div class="muted small" style="align-self:end">最近修改：{{ cur.updated_by }} · {{ fmt(cur.updated) }}</div></div>
+          <div><label>创作要求（{{ form.content.length }} / {{ d.max }} 字）</label>
+            <textarea v-model="form.content" rows="14" :maxlength="d.max"></textarea></div>
+          <div class="row spread"><div class="row"><button class="ghost" @click="reset">恢复为系统默认内容</button>
+              <button class="ghost" @click="toggleVer">{{ showVer ? '收起历史' : '版本历史' }}</button></div>
+            <div class="row"><button class="ghost" @click="create">另存为新提示词</button>
+              <button v-if="!cur.builtin && mine(cur)" class="ghost danger" @click="remove">删除</button>
+              <button class="primary" :disabled="busy || !dirty" @click="save">保存</button></div></div>
+          <div v-if="showVer" class="stack"><div v-if="!versions.length" class="muted small">暂无历史</div>
+            <div v-for="v in versions" :key="v.id" class="ver"><div class="row spread"><span class="small">{{ fmt(v.at) }} · {{ v.by }}</span>
+              <button class="ghost small" @click="useVer(v)">载入这一版</button></div><div class="muted small ver-text">{{ v.content }}</div></div></div>
+        </div>
+        <details class="panel"><summary>系统固定的输出格式（只读，始终拼在你的创作要求后面）</summary><pre class="fixed">{{ d.fixed }}</pre></details>
+      </div>
+    </div></div>`,
 };
 
 // ---------- 素材库 ----------
@@ -746,7 +827,7 @@ const SystemPage = {
 };
 
 // ---------- 外壳：左侧菜单 + 右侧页面 ----------
-const PAGES = { overview: OverviewPage, list: ListPage, new: NewPage, project: ProjectPage, templates: TemplatesPage, library: LibraryPage,
+const PAGES = { overview: OverviewPage, list: ListPage, new: NewPage, project: ProjectPage, templates: TemplatesPage, prompts: PromptsPage, library: LibraryPage,
   stats: StatsPage, members: MembersPage, system: SystemPage };
 
 const App = {
@@ -755,7 +836,7 @@ const App = {
       const c = store.cfg, admin = c.role === "admin";
       return [
         { group: "创作", items: [["overview", "#/", "概览", "⌂"], ["new", "#/new", "新建短片", "＋"], ["list", "#/list", "全部短片", "▤"]] },
-        { group: "资产", items: [["templates", "#/templates", "风格模板", "◇"], ["library", "#/library", "素材库", "▦"]] },
+        { group: "资产", items: [["templates", "#/templates", "风格组合", "◇"], ["prompts", "#/prompts", "写作提示词", "✎"], ["library", "#/library", "素材库", "▦"]] },
         { group: "管理", items: [["stats", "#/stats", "成本看板", "▥"],
           ...(c.auth !== "open" || admin ? [["members", "#/members", admin ? "成员" : "我的账号", "◎"]] : []),
           ...(admin ? [["system", "#/system", "系统自检", "⚙"]] : [])] },
