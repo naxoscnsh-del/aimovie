@@ -724,7 +724,7 @@ const App = {
   },
   template: `<div class="layout" :class="{ 'menu-open': store.menuOpen }">
     <aside class="sidebar">
-      <div class="brand"><span class="logo">▶</span>AI 短片工作台</div>
+      <div class="brand"><span class="logo">▶</span>AI 短片工作台</div><div class="brand-sub">AI 视频创作中心</div>
       <nav class="menu"><div v-for="g in menu" :key="g.group" class="menu-group"><div class="menu-title">{{ g.group }}</div>
         <a v-for="m in g.items" :key="m[0]" :href="m[1]" class="menu-item" :class="{ active: active(m[0]) }" @click="store.menuOpen = false">
           <span class="ico">{{ m[3] }}</span>{{ m[2] }}</a></div></nav>
