@@ -18,7 +18,7 @@ RETRY_STATUS = {429, 500, 502, 503, 504}
 
 
 class HttpClient:
-    def __init__(self, base_url: str, api_key: str, timeout: float = 120.0,
+    def __init__(self, base_url: str, api_key: str, timeout: float = 300.0,
                  retries: int = 3, session: requests.Session | None = None,
                  sleep=time.sleep):
         self.base_url = base_url.rstrip("/")
@@ -43,7 +43,12 @@ class HttpClient:
             try:
                 resp = self.session.request(method, url, json=json,
                                             headers=self._headers(), timeout=self.timeout)
-            except requests.RequestException as e:  # 网络错误也重试
+            except requests.ReadTimeout as e:
+                # POST 可能已被服务端受理并计费（图片/视频生成），重试会重复扣费 → 不重试，交给上层提示
+                if method.upper() == "POST":
+                    raise ApiError(0, f"读取超时（请求可能已被受理，请到方舟控制台确认后再重试）：{e}", url) from e
+                last = e
+            except requests.RequestException as e:  # 连接失败等网络错误：请求没送达，可以重试
                 last = e
             else:
                 if resp.status_code < 400:

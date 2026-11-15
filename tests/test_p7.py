@@ -32,3 +32,47 @@ def test_package_requires_final(tmp_path):
     pid = r.json()["id"]
     assert c.get(f"/api/projects/{pid}/package").status_code == 400
     assert c.get("/api/projects/nope/package").status_code in (404,)
+
+
+def test_post_read_timeout_not_retried():
+    """生成类 POST 读超时不能重试（服务端可能已受理并计费）；GET 和连接失败仍重试。"""
+    import pytest
+    import requests
+    from videogen.http import ApiError, HttpClient
+
+    class Sess:
+        def __init__(self, exc):
+            self.calls, self.exc = 0, exc
+
+        def request(self, *a, **k):
+            self.calls += 1
+            raise self.exc
+
+    s = Sess(requests.ReadTimeout("slow"))
+    c = HttpClient("https://x", "k", session=s, sleep=lambda _t: None)
+    with pytest.raises(ApiError):
+        c.post("images/generations", {})
+    assert s.calls == 1
+    s = Sess(requests.ReadTimeout("slow"))
+    with pytest.raises(requests.ReadTimeout):
+        HttpClient("https://x", "k", session=s, sleep=lambda _t: None).get("t")
+    assert s.calls == 4
+    s = Sess(requests.ConnectionError("down"))
+    with pytest.raises(requests.ConnectionError):
+        HttpClient("https://x", "k", session=s, sleep=lambda _t: None).post("p", {})
+    assert s.calls == 4
+
+
+def test_seedance_audio_off_by_default():
+    from videogen.config import Settings
+    from videogen.models import Seedance
+
+    class C:
+        def post(self, path, body):
+            self.body = body
+            return {"id": "t1"}
+
+    import tempfile, pathlib
+    f = pathlib.Path(tempfile.mkdtemp()) / "a.png"; f.write_bytes(b"\x89PNG")
+    c = C(); Seedance(Settings(), client=c).submit("p", f, 5)
+    assert c.body["generate_audio"] is False

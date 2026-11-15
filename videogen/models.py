@@ -80,8 +80,8 @@ class Seedance:
             "resolution": self.s.seedance_resolution,
             "watermark": False,
         }
-        if self.s.seedance_generate_audio is not None:
-            body["generate_audio"] = self.s.seedance_generate_audio
+        # 成片合成时会丢掉模型自带的音轨（旁白/BGM 另行合成），默认关闭，省时间和费用；SEEDANCE_GENERATE_AUDIO 可覆盖
+        body["generate_audio"] = bool(self.s.seedance_generate_audio)
         resp = self.client.post("contents/generations/tasks", body)
         return resp["id"]
 
