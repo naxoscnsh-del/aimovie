@@ -173,18 +173,13 @@ SQLite 任务队列 + 后台线程（web/jobs.py）── 每个项目同一时�
 ## 已知限制
 
 - 未用真实 API Key 联调过，所有测试基于模拟接口（FFmpeg 合成为真实执行）
-- 登录用浏览器自带的 HTTP Basic 弹窗，退出需关闭浏览器；对外网开放时请在前面加 HTTPS（如 Nginx / Caddy）
+- 部署在 ainewimage.com 下用门户 SSO 登录（见下）；单机/本地试用可用成员账号（HTTP Basic，退出需关闭浏览器），对外网开放时请在前面加 HTTPS
+- 已删除的项目先进回收站（data/trash），超过 `TRASH_KEEP_DAYS`（默认 30）天自动彻底删除
 - 进度用 2 秒轮询；视频生成时长取决于方舟排队
 - 方舟返回的图片/视频链接 24 小时过期，系统会在生成后立即下载到本地
 - 首尾帧模式需所选 Seedance 版本支持（2.0 起支持 first_frame + last_frame）；不支持时请不要勾选过渡
 - TTS 音色 ID 需在火山引擎控制台确认已开通
 
-
-## 全局账号登录（OIDC）
-
-`.env` 设 `AUTH_MODE=oidc` 及 `OIDC_ISSUER / OIDC_CLIENT_ID / OIDC_CLIENT_SECRET / PUBLIC_URL / SESSION_SECRET`（见 `.env.example`），
-身份中心里为 `aimovie` 登记回调 `https://www.ainewimage.com/movie/auth/callback`。登录后用 id_token 的 `sub` 作账号标识；
-`OIDC_ADMINS` 里的人固定为管理员，其他人默认成员，管理员可在「成员」页调整。nginx 切换脚本加 `--no-gate` 去掉门户登录拦截，避免二次登录。
 
 ## 门户 SSO（推荐）
 
@@ -192,3 +187,12 @@ SQLite 任务队列 + 后台线程（web/jobs.py）── 每个项目同一时�
 浏览器带着门户登录写下的 `ni_portal` Cookie 访问 `/movie/`，应用把它转发给 `HRBP_BASE_URL/api/portal/session` 验证并取姓名，
 账号 ID 即 HRBP User.id。未登录跳转门户登录页，登录后从门户进入；成员页可调整角色，`PORTAL_ADMINS` 里的人固定为管理员。
 此模式下 nginx 切换脚本**不要**加 `--no-gate`（保留门户 auth_request 即可）。
+
+## 备用：OIDC 登录（未采用）
+
+门户 SSO 不可用、或将来部署到门户域名之外时再考虑；需要身份中心登记 `aimovie` 客户端。
+
+`.env` 设 `AUTH_MODE=oidc` 及 `OIDC_ISSUER / OIDC_CLIENT_ID / OIDC_CLIENT_SECRET / PUBLIC_URL / SESSION_SECRET`（见 `.env.example`），
+身份中心里为 `aimovie` 登记回调 `https://www.ainewimage.com/movie/auth/callback`。登录后用 id_token 的 `sub` 作账号标识；
+`OIDC_ADMINS` 里的人固定为管理员，其他人默认成员，管理员可在「成员」页调整。nginx 切换脚本加 `--no-gate` 去掉门户登录拦截，避免二次登录。
+

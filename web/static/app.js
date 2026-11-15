@@ -4,7 +4,7 @@ const { createApp, reactive, ref, computed, watch, onMounted, onBeforeUnmount, n
 
 // ---------- 基础 ----------
 const BASE = location.pathname.replace(/\/[^/]*$/, "");        // 子路径部署，如 /movie
-const store = reactive({ cfg: null, toast: null, route: { name: "list", params: {} }, menuOpen: false });
+const store = reactive({ cfg: null, toast: null, route: { name: "overview", params: {} }, menuOpen: false });
 
 async function api(path, opts = {}) {
   const init = { method: opts.method || "GET", headers: {} };
@@ -43,9 +43,9 @@ function parseRoute() {
   const h = location.hash.replace(/^#/, "") || "/";
   let m;
   if ((m = h.match(/^\/p\/([\w-]+)/))) return { name: "project", params: { id: m[1] } };
-  const map = { "/": "list", "/new": "new", "/templates": "templates", "/library": "library", "/stats": "stats",
+  const map = { "/": "overview", "/list": "list", "/new": "new", "/templates": "templates", "/library": "library", "/stats": "stats",
     "/members": "members", "/system": "system" };
-  return { name: map[h.split("?")[0]] || "list", params: {} };
+  return { name: map[h.split("?")[0]] || "overview", params: {} };
 }
 window.addEventListener("hashchange", () => { store.route = parseRoute(); store.menuOpen = false; });
 
@@ -144,6 +144,44 @@ const NewPage = {
       <div class="row spread"><span class="muted small">单片花费上限 \${{ cfg.budget_usd }}</span>
         <button class="primary" :disabled="busy" @click="submit">{{ busy ? '提交中…' : '生成脚本' }}</button></div>
     </div></div>`,
+};
+
+// ---------- 概览 ----------
+const OverviewPage = {
+  components: { Badge, PageHead },
+  setup() {
+    const items = ref(null), stats = ref(null);
+    onMounted(async () => {
+      try { [items.value, stats.value] = await Promise.all([api("/api/projects"), api("/api/stats")]); }
+      catch (e) { fail(e); items.value = items.value || []; }
+    });
+    const TODO = ["script_review", "image_review", "image_selected", "shot_review", "failed"];
+    const running = computed(() => (items.value || []).filter((p) => ["scripting", "imaging", "generating", "rendering"].includes(p.status)));
+    const todo = computed(() => (items.value || []).filter((p) => TODO.includes(p.status) && (!store.cfg.user || p.owner === store.cfg.user)));
+    const recent = computed(() => (items.value || []).slice(0, 6));
+    const month = computed(() => stats.value ? stats.value.month : null);
+    return { items, stats, running, todo, recent, month, P_STATUS, usd, go, cfg: store.cfg };
+  },
+  template: `<div class="page">
+    <PageHead :title="cfg.user ? cfg.user + '，你好' : '概览'" sub="创作进度、待你处理的短片和本月花费"><button class="primary" @click="go('#/new')">新建短片</button></PageHead>
+    <div v-if="items === null" class="muted">加载中…</div>
+    <template v-else>
+      <div class="tiles">
+        <div class="tile"><div class="muted small">全部短片</div><div class="big">{{ items.length }}</div><div class="muted small">已完成 {{ items.filter(p => p.status === 'done').length }} 部</div></div>
+        <div class="tile"><div class="muted small">生成中</div><div class="big">{{ running.length }}</div><div class="muted small">后台任务进行中</div></div>
+        <div class="tile"><div class="muted small">待我处理</div><div class="big">{{ todo.length }}</div><div class="muted small">待确认或失败</div></div>
+        <div class="tile" v-if="month"><div class="muted small">本月花费</div><div class="big">{{ usd(month.spent_usd) }}</div>
+          <div class="muted small">{{ month.team_budget_usd ? '团队月预算 ' + usd(month.team_budget_usd) + (month.warn ? ' · 已超 80%' : '') : '未设团队月预算' }}</div></div>
+      </div>
+      <div v-if="todo.length" class="panel"><h2>待我处理</h2>
+        <div class="plist"><a v-for="p in todo" :key="p.id" class="pcard" :href="'#/p/' + p.id"><Badge :map="P_STATUS" :value="p.status" />
+          <div class="t">{{ p.title }}</div><div class="muted small">{{ p.created_at.slice(5, 16) }} · {{ p.shots }} 个镜头</div></a></div></div>
+      <div class="panel"><div class="row spread"><h2>最近的短片</h2><a href="#/list" class="small">查看全部</a></div>
+        <div v-if="!recent.length" class="empty">还没有短片。<a href="#/new">新建一部</a></div>
+        <div v-else class="plist"><a v-for="p in recent" :key="p.id" class="pcard" :href="'#/p/' + p.id">
+          <div class="row spread"><Badge :map="P_STATUS" :value="p.status" /><span class="muted small">{{ p.ratio }}</span></div>
+          <div class="t">{{ p.title }}</div><div class="muted small">{{ p.created_at.slice(5, 16) }} · 已花 {{ usd(p.cost.spent_usd) }}<span v-if="p.owner"> · {{ p.owner }}</span></div></a></div></div>
+    </template></div>`,
 };
 
 // ---------- 短片列表 ----------
@@ -300,7 +338,8 @@ const ImagesTab = {
       try { await api(`/api/projects/${props.p.id}/save-asset`, { method: "POST", body: { shot_id: s.id, name, kind } }); toast("已存入素材库"); }
       catch (e) { fail(e); }
     }
-    return { edits, allSel, anyCand, unselected, pick, refine, saveAsset, ratioCss, S_STATUS };
+    const failed = computed(() => props.p.shots.filter((s) => s.state.status === "failed").map((s) => s.index));
+    return { edits, allSel, anyCand, unselected, pick, refine, saveAsset, ratioCss, S_STATUS, failed };
   },
   template: `<div v-if="!p.shots.length" class="panel empty">先完成脚本</div>
     <div v-else>
@@ -327,6 +366,7 @@ const ImagesTab = {
           <button class="ghost small" @click="saveAsset(s)">存入素材库</button></div>
       </div>
       <div class="actions">
+        <button v-if="failed.length" :disabled="busy" @click="$emit('job', 'images', { shots: failed })">重试失败的 {{ failed.length }} 镜</button>
         <button :disabled="busy" @click="$emit('job', 'images')">{{ anyCand ? '补齐未出图的镜头' : '生成全部场景图' }}</button>
         <button class="primary" :disabled="busy || !allSel" @click="$emit('job', 'videos', {}, 'videos')">
           {{ allSel ? '生成镜头视频' : '还有 ' + unselected + ' 镜未选图' }}</button>
@@ -341,7 +381,8 @@ const VideosTab = {
   setup(props) {
     const allVid = computed(() => props.p.shots.length && props.p.shots.every((s) => s.state.video));
     const frame = (s) => (s.state.selected ? s.state.candidates[s.state.selected - 1] : null);
-    return { allVid, frame, ratioCss, S_STATUS };
+    const failed = computed(() => props.p.shots.filter((s) => s.state.status === "failed" && s.state.selected).map((s) => s.index));
+    return { allVid, frame, ratioCss, S_STATUS, failed };
   },
   template: `<div v-if="!p.shots.length" class="panel empty">先完成脚本</div>
     <div v-else>
@@ -363,6 +404,7 @@ const VideosTab = {
         </div>
       </div>
       <div class="actions">
+        <button v-if="failed.length" :disabled="busy" @click="$emit('job', 'videos', { shots: failed })">重试失败的 {{ failed.length }} 镜</button>
         <button :disabled="busy || allVid" @click="$emit('job', 'videos')">补齐缺失的镜头</button>
         <button class="primary" :disabled="busy || !allVid" @click="$emit('tab', 'final')">去合成成片</button>
       </div>
@@ -392,7 +434,8 @@ const FinalTab = {
       try { emit("update", await api(`/api/projects/${props.p.id}/bgm`, { method: "POST", form: fd })); toast("BGM 已上传"); }
       catch (e) { fail(e); }
     }
-    return { meta, hasNarr, allVid, opt, others, bgm, metaText, compose, upload, cfg: store.cfg };
+    const pkgUrl = computed(() => `${BASE}/api/projects/${props.p.id}/package`);
+    return { meta, hasNarr, allVid, opt, others, bgm, metaText, compose, upload, pkgUrl, cfg: store.cfg };
   },
   template: `<div>
     <div class="panel">
@@ -401,7 +444,8 @@ const FinalTab = {
         <video class="final" :src="p.final" controls playsinline></video>
         <div class="row" style="justify-content:center;margin-top:12px">
           <a :href="p.final" :download="p.title + '.mp4'"><button class="primary">下载成片</button></a>
-          <a :href="p.final.replace(/\\.mp4$/, '.srt')" :download="p.title + '.srt'"><button>下载字幕</button></a></div>
+          <a :href="p.final.replace(/\\.mp4$/, '.srt')" :download="p.title + '.srt'"><button>下载字幕</button></a>
+          <a :href="pkgUrl"><button>打包下载（含各画幅和脚本）</button></a></div>
       </template>
       <div v-else class="empty">{{ busy ? '处理中…' : allVid ? '所有镜头已就绪，可以合成成片' : '还有镜头没有视频，先到「视频」补齐' }}</div>
     </div>
@@ -475,7 +519,7 @@ const ProjectPage = {
     }
     async function remove() {
       if (!confirm(`删除「${p.value.title}」？会移到服务器回收站，管理员可找回。`)) return;
-      try { await api(`/api/projects/${p.value.id}`, { method: "DELETE" }); toast("已删除"); go("#/"); } catch (e) { fail(e); }
+      try { await api(`/api/projects/${p.value.id}`, { method: "DELETE" }); toast("已删除"); go("#/list"); } catch (e) { fail(e); }
     }
     const banner = computed(() => p.value && (p.value.job || (p.value.last_job && p.value.last_job.status === "failed" ? p.value.last_job : null)));
     const logTail = computed(() => banner.value ? (banner.value.log || "").trim().split("\n").slice(-6).join("\n") : "");
@@ -494,12 +538,12 @@ const ProjectPage = {
     return { p, tab, busy, notFound, job, cancelJob, duplicate, remove, banner, logTail, tabs, meter, update, usd, P_STATUS };
   },
   template: `<div class="page">
-    <div v-if="notFound" class="panel empty">{{ notFound }}<p><a href="#/">返回列表</a></p></div>
+    <div v-if="notFound" class="panel empty">{{ notFound }}<p><a href="#/list">返回列表</a></p></div>
     <div v-else-if="!p" class="muted">加载中…</div>
     <template v-else>
       <div class="page-head">
         <div class="grow">
-          <div class="crumb"><a href="#/">全部短片</a> / {{ p.title }}</div>
+          <div class="crumb"><a href="#/list">全部短片</a> / {{ p.title }}</div>
           <div class="row" style="margin-top:4px"><h1>{{ p.title }}</h1><Badge :map="P_STATUS" :value="p.status" /></div>
           <div class="muted small" style="margin-top:4px">{{ p.ratio }} · 约 {{ p.brief.duration }} 秒<span v-if="p.owner"> · {{ p.owner }}</span>
             <span v-if="p.brief.template"> · 模板「{{ p.brief.template.name }}」</span></div>
@@ -702,7 +746,7 @@ const SystemPage = {
 };
 
 // ---------- 外壳：左侧菜单 + 右侧页面 ----------
-const PAGES = { list: ListPage, new: NewPage, project: ProjectPage, templates: TemplatesPage, library: LibraryPage,
+const PAGES = { overview: OverviewPage, list: ListPage, new: NewPage, project: ProjectPage, templates: TemplatesPage, library: LibraryPage,
   stats: StatsPage, members: MembersPage, system: SystemPage };
 
 const App = {
@@ -710,7 +754,7 @@ const App = {
     const menu = computed(() => {
       const c = store.cfg, admin = c.role === "admin";
       return [
-        { group: "创作", items: [["new", "#/new", "新建短片", "＋"], ["list", "#/", "全部短片", "▤"]] },
+        { group: "创作", items: [["overview", "#/", "概览", "⌂"], ["new", "#/new", "新建短片", "＋"], ["list", "#/list", "全部短片", "▤"]] },
         { group: "资产", items: [["templates", "#/templates", "风格模板", "◇"], ["library", "#/library", "素材库", "▦"]] },
         { group: "管理", items: [["stats", "#/stats", "成本看板", "▥"],
           ...(c.auth !== "open" || admin ? [["members", "#/members", admin ? "成员" : "我的账号", "◎"]] : []),

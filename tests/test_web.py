@@ -127,6 +127,12 @@ def test_full_web_flow(server, tmp_path):
     srt = requests.get(server + p["final"].replace(".mp4", ".srt"), auth=AUTH)
     assert "改过的旁白" in srt.content.decode("utf-8")
 
+    pk = requests.get(f"{server}/api/projects/{pid}/package", auth=AUTH)  # 打包下载
+    assert pk.status_code == 200 and pk.headers["content-type"] == "application/zip"
+    import io, zipfile
+    names = zipfile.ZipFile(io.BytesIO(pk.content)).namelist()
+    assert any(n.endswith(".mp4") for n in names) and any(n.endswith(".srt") for n in names) and any(n.endswith(".json") for n in names)
+
     lst = requests.get(f"{server}/api/projects", auth=AUTH).json()
     assert lst[0]["id"] == pid and lst[0]["title"] == "清晨咖啡"
 

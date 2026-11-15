@@ -11,6 +11,7 @@ import binascii
 import json
 import os
 import re
+import threading
 import secrets
 
 import requests
@@ -36,6 +37,7 @@ from videogen.pipeline import Pipeline, Project, StageError
 from videogen.script import ScriptError
 
 from .jobs import JobStore, ProjectBusy, Runner, default_factory
+from .cleanup import start_daily
 from .portal import PortalAuth, PortalConfig, PortalDenied, PortalError
 from .oidc import OIDC, SESSION_COOKIE, STATE_COOKIE, OIDCConfig, OIDCError
 from .team import ASSET_KINDS, TeamError, TeamStore
@@ -382,6 +384,39 @@ def create_app(settings: Settings | None = None, data_dir: Path | None = None,
         p.save()
         store.enqueue(p.state["id"], "script", user=user_of(req))
         return JSONResponse(view(p, req=req), status_code=201)
+
+    async def package(req: Request):
+        """打包下载：成片、各画幅导出、字幕、脚本。"""
+        pid = req.path_params["pid"]
+        try:
+            p = load(pid)
+            view(p, req=req)  # 复用读取权限检查
+        except LookupError:
+            return err("项目不存在", 404)
+        except PermissionError as e:
+            return err(str(e), 403)
+        st = p.state
+        names: list[tuple[Path, str]] = []
+        title = re.sub(r'[\\/:*?"<>|\s]+', "_", st.get("title") or pid)[:40] or pid
+        if st.get("final"):
+            f = p.root / st["final"]
+            names += [(f, f"{title}.mp4"), (f.with_suffix(".srt"), f"{title}.srt")]
+        for r, rel in (st.get("exports") or {}).items():
+            names.append((p.root / rel, f"{title}_{r.replace(':', 'x')}.mp4"))
+        if p.script_path.exists():
+            names.append((p.script_path, f"{title}_脚本.json"))
+        names = [(f, n) for f, n in names if f.is_file()]
+        if not any(n.endswith(".mp4") for _f, n in names):
+            return err("还没有成片可以打包", 400)
+        import zipfile
+        tmp = tempfile.NamedTemporaryFile(suffix=".zip", delete=False, dir=data)
+        tmp.close()
+        with zipfile.ZipFile(tmp.name, "w", zipfile.ZIP_STORED) as z:  # 视频已压缩，不再二次压缩
+            for f, n in names:
+                z.write(f, n)
+        from starlette.background import BackgroundTask
+        return FileResponse(tmp.name, media_type="application/zip", filename=f"{title}.zip",
+                            background=BackgroundTask(lambda: Path(tmp.name).unlink(missing_ok=True)))
 
     async def get_project(req: Request):
         try:
@@ -913,7 +948,10 @@ def create_app(settings: Settings | None = None, data_dir: Path | None = None,
     async def lifespan(_app):
         team.ensure_admin(os.environ.get("ADMIN_USER", ""), os.environ.get("ADMIN_PASSWORD", ""))
         runner.start()
+        stop_cleanup = threading.Event()
+        start_daily(data / "trash", stop_cleanup)
         yield
+        stop_cleanup.set()
         runner.stop()
 
     routes = [
@@ -947,6 +985,7 @@ def create_app(settings: Settings | None = None, data_dir: Path | None = None,
         Route("/api/assets", list_assets, methods=["GET"]),
         Route("/api/assets", add_asset, methods=["POST"]),
         Route("/api/assets/{aid:int}", delete_asset, methods=["DELETE"]),
+        Route("/api/projects/{pid}/package", package),
         Route("/api/projects/{pid}/save-asset", save_shot_asset, methods=["POST"]),
         Route("/api/projects/{pid}/duplicate", duplicate_project, methods=["POST"]),
         Route("/api/projects/{pid}", delete_project, methods=["DELETE"]),
