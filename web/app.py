@@ -9,6 +9,7 @@ import base64
 import hashlib
 import binascii
 import json
+import logging
 import os
 import re
 import threading
@@ -37,6 +38,7 @@ from videogen.pipeline import Pipeline, Project, StageError
 from videogen.script import ScriptError
 
 from .jobs import JobStore, ProjectBusy, Runner, default_factory
+from videogen import settings_schema as sch
 from .cleanup import start_daily
 from .portal import PortalAuth, PortalConfig, PortalDenied, PortalError
 from .oidc import OIDC, SESSION_COOKIE, STATE_COOKIE, OIDCConfig, OIDCError
@@ -183,6 +185,14 @@ def create_app(settings: Settings | None = None, data_dir: Path | None = None,
                     workers=workers if workers is not None else int(os.environ.get("WORKERS") or 2))
     password = password if password is not None else os.environ.get("APP_PASSWORD", "")
     team = TeamStore(data / "app.db", data / "library")
+    base_values = sch.snapshot(s)  # .env / 默认值基线，页面「恢复」时回到这里
+    good: dict = {}
+    for k, o in team.settings_all().items():  # 页面保存过的设置叠在 .env 之上
+        try:
+            good[k] = sch.parse(sch.BY_KEY[k], o["value"])
+        except (KeyError, ValueError) as e:
+            logging.getLogger("aimovie.settings").warning("忽略无效的页面设置 %s：%s", k, e)
+    sch.apply(s, good)
     base = normalize_base(base_path if base_path is not None else os.environ.get("BASE_PATH", ""))
     oidc_cfg = oidc_config if oidc_config is not None else OIDCConfig.from_env()
     oidc = OIDC(oidc_cfg, base, session=oidc_session) if oidc_cfg else None
@@ -844,6 +854,56 @@ def create_app(settings: Settings | None = None, data_dir: Path | None = None,
         team.delete_template(tp["id"])
         return JSONResponse({"ok": True})
 
+    # ---------- 模型与参数 ----------
+    def settings_payload() -> dict:
+        saved = team.settings_all()
+        groups = []
+        for g in sch.GROUPS:
+            fields = []
+            for f in (x for x in sch.FIELDS if x.group == g):
+                cur = sch.get_value(s, f.key)
+                d = {"key": f.key, "label": f.label, "kind": f.kind, "help": f.help, "unit": f.unit,
+                     "choices": list(f.choices), "lo": f.lo, "hi": f.hi,
+                     "overridden": f.key in saved, "by": saved.get(f.key, {}).get("by", ""), "at": saved.get(f.key, {}).get("at")}
+                if f.kind == "secret":
+                    d.update(value="", masked=sch.mask(cur), is_set=bool(cur),
+                             base_set=bool(base_values[f.key]))
+                else:
+                    show = lambda v: ",".join(map(str, v)) if isinstance(v, list) else v
+                    d.update(value=show(cur), base=show(base_values[f.key]))
+                fields.append(d)
+            groups.append({"name": g, "fields": fields})
+        return {"groups": groups}
+
+    async def get_settings(req: Request):
+        if not is_admin(req):
+            return err("只有管理员可以修改参数", 403)
+        return JSONResponse(settings_payload())
+
+    async def put_settings(req: Request):
+        if not is_admin(req):
+            return err("只有管理员可以修改参数", 403)
+        body = await req.json()
+        raw, reset = body.get("values") or {}, [k for k in (body.get("reset") or []) if k in sch.BY_KEY]
+        parsed: dict = {}
+        try:
+            for k, v in raw.items():
+                f = sch.BY_KEY.get(k)
+                if not f:
+                    raise ValueError(f"未知参数 {k}")
+                if f.kind == "secret" and str(v or "").strip() == "":
+                    continue  # 密钥留空 = 不修改
+                parsed[k] = sch.parse(f, v)
+            merged = {**sch.snapshot(s), **{k: base_values[k] for k in reset}, **parsed}
+            sch.cross_check(merged)
+        except ValueError as e:
+            return err(str(e))
+        user = user_of(req)
+        await run_in_threadpool(team.settings_save, parsed, [k for k in reset if k not in parsed], user)
+        sch.apply(s, {**{k: base_values[k] for k in reset if k not in parsed}, **parsed})
+        logging.getLogger("aimovie.settings").warning("参数已修改 by %s：改 %s，恢复 %s", user, sorted(parsed), sorted(reset))
+        return JSONResponse(settings_payload())
+
     # ---------- 写作提示词 ----------
     async def list_prompts(_req):
         from videogen.script import DEFAULT_GUIDE, FORMAT_PROMPT, GUIDE_MAX
@@ -1056,6 +1116,8 @@ def create_app(settings: Settings | None = None, data_dir: Path | None = None,
         Route("/api/users", list_users, methods=["GET"]),
         Route("/api/users", add_user, methods=["POST"]),
         Route("/api/users/{name}", update_user, methods=["PATCH"]),
+        Route("/api/settings", get_settings, methods=["GET"]),
+        Route("/api/settings", put_settings, methods=["PUT"]),
         Route("/api/prompts", list_prompts, methods=["GET"]),
         Route("/api/prompts", add_prompt, methods=["POST"]),
         Route("/api/prompts/{pid:int}", update_prompt, methods=["PUT"]),

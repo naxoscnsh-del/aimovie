@@ -63,6 +63,8 @@ class TeamStore:
             CREATE TABLE IF NOT EXISTS prompt_versions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, prompt_id INTEGER NOT NULL, content TEXT NOT NULL,
                 by TEXT NOT NULL DEFAULT '', at REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_by TEXT NOT NULL DEFAULT '', updated REAL NOT NULL);
             CREATE TABLE IF NOT EXISTS assets (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, kind TEXT NOT NULL,
                 file TEXT NOT NULL, owner TEXT NOT NULL DEFAULT '', source TEXT NOT NULL DEFAULT '',
@@ -368,3 +370,21 @@ class TeamStore:
             rows = self.conn.execute("SELECT id, content, by, at FROM prompt_versions WHERE prompt_id=? ORDER BY id DESC",
                                      (pid,)).fetchall()
         return [dict(r) for r in rows]
+
+    # ---------- 页面设置（覆盖 .env）----------
+    def settings_all(self) -> dict[str, dict]:
+        with self.lock:
+            rows = self.conn.execute("SELECT key, value, updated_by, updated FROM app_settings").fetchall()
+        return {r["key"]: {"value": json.loads(r["value"]), "by": r["updated_by"], "at": r["updated"]} for r in rows}
+
+    def settings_save(self, values: dict, reset: list[str], user: str) -> None:
+        now = time.time()
+        with self.lock:
+            for k, v in values.items():
+                self.conn.execute(
+                    "INSERT INTO app_settings(key, value, updated_by, updated) VALUES (?,?,?,?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_by=excluded.updated_by, updated=excluded.updated",
+                    (k, json.dumps(v, ensure_ascii=False), user, now))
+            for k in reset:
+                self.conn.execute("DELETE FROM app_settings WHERE key=?", (k,))
+            self.conn.commit()

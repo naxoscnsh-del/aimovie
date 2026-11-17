@@ -186,3 +186,9 @@ code { background: #eef3fa; padding: 1px 5px; border-radius: 4px; font-size: 13p
 .ver-text { white-space: pre-wrap; max-height: 96px; overflow: auto; margin-top: 4px; }
 .fixed { white-space: pre-wrap; font: 12.5px/1.6 ui-monospace, Menlo, Consolas, monospace; color: var(--muted); margin: 10px 0 0; }
 @media (max-width: 820px) { .prompt-layout { grid-template-columns: 1fr; } }
+
+/* 模型与参数 */
+.set-row { display: grid; grid-template-columns: 1fr 1.2fr 150px; gap: 12px; align-items: center; padding: 8px 0; border-top: 1px solid var(--line, #e5e9f0); }
+.set-row:first-of-type { border-top: 0; }
+.set-input input:not([type=checkbox]), .set-input select { width: 100%; }
+@media (max-width: 760px) { .set-row { grid-template-columns: 1fr; } }

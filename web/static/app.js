@@ -44,7 +44,7 @@ function parseRoute() {
   let m;
   if ((m = h.match(/^\/p\/([\w-]+)/))) return { name: "project", params: { id: m[1] } };
   const map = { "/": "overview", "/list": "list", "/new": "new", "/templates": "templates", "/prompts": "prompts", "/library": "library", "/stats": "stats",
-    "/members": "members", "/system": "system" };
+    "/members": "members", "/system": "system", "/settings": "settings" };
   return { name: map[h.split("?")[0]] || "overview", params: {} };
 }
 window.addEventListener("hashchange", () => { store.route = parseRoute(); store.menuOpen = false; });
@@ -826,9 +826,64 @@ const SystemPage = {
       <div class="muted small" style="margin-top:10px">回收站里有 {{ d.trash }} 个已删除项目（data/trash）。后台任务线程 {{ d.workers }} 个。</div></div></div>`,
 };
 
+// ---------- 模型与参数 ----------
+const SettingsPage = {
+  components: { PageHead },
+  setup() {
+    const groups = ref(null), form = reactive({}), reset = reactive({}), saving = ref(false);
+    const fill = (d) => {
+      groups.value = d.groups;
+      for (const k of Object.keys(form)) delete form[k];
+      for (const k of Object.keys(reset)) delete reset[k];
+      for (const g of d.groups) for (const f of g.fields) form[f.key] = f.kind === "secret" ? "" : f.kind === "bool" ? !!f.value : f.value;
+    };
+    const load = async () => { try { fill(await api("/api/settings")); } catch (e) { fail(e); } };
+    onMounted(load);
+    const changed = (f) => f.kind === "secret" ? form[f.key] !== "" : form[f.key] !== (f.kind === "bool" ? !!f.value : f.value);
+    const dirty = computed(() => groups.value && groups.value.some((g) => g.fields.some((f) => changed(f) || reset[f.key])));
+    const save = async () => {
+      const f0 = groups.value.flatMap((g) => g.fields), values = {}, rs = [];
+      for (const f of f0) {
+        if (reset[f.key]) rs.push(f.key);
+        else if (changed(f)) values[f.key] = form[f.key];
+      }
+      const turnOnReal = f0.find((f) => f.key === "demo_mode") && values.demo_mode === false;
+      if (turnOnReal && !confirm("关闭演示模式后，新任务会调用真实接口并产生费用。确认关闭？")) return;
+      saving.value = true;
+      try { fill(await api("/api/settings", { method: "PUT", body: { values, reset: rs } })); store.cfg = await api("/api/config"); toast("已保存，新任务立即生效"); }
+      catch (e) { fail(e); }
+      saving.value = false;
+    };
+    const when = (t) => (t ? new Date(t * 1000).toLocaleString() : "");
+    return { groups, form, reset, dirty, save, saving, load, when, go };
+  },
+  template: `<div class="page"><PageHead title="模型与参数" sub="修改后保存，新建的任务立即按新参数运行；已在跑的任务不受影响。页面保存的值优先于服务器 .env，可逐项恢复">
+      <button @click="go('#/system')">去系统自检测试连通</button>
+      <button class="primary" :disabled="!dirty || saving" @click="save">{{ saving ? '保存中…' : '保存修改' }}</button></PageHead>
+    <div v-if="!groups" class="muted">加载中…</div>
+    <template v-else>
+      <div class="panel stack" v-for="g in groups" :key="g.name"><h2>{{ g.name }}</h2>
+        <div v-for="f in g.fields" :key="f.key" class="set-row">
+          <div class="set-label"><div>{{ f.label }} <span v-if="f.overridden" class="badge run" :title="'修改人 ' + (f.by || '-') + ' · ' + when(f.at)">页面设置</span></div>
+            <div class="muted small">{{ f.help }}</div></div>
+          <div class="set-input">
+            <label v-if="f.kind === 'bool'" class="row"><input type="checkbox" v-model="form[f.key]" :disabled="reset[f.key]"> {{ form[f.key] ? '开' : '关' }}</label>
+            <select v-else-if="f.kind === 'choice'" v-model="form[f.key]" :disabled="reset[f.key]"><option v-for="c in f.choices" :key="c" :value="c">{{ c }}</option></select>
+            <input v-else-if="f.kind === 'secret'" type="password" autocomplete="new-password" v-model="form[f.key]" :disabled="reset[f.key]"
+              :placeholder="f.is_set ? '已设置 ' + f.masked + '（留空不修改）' : '未设置'">
+            <div v-else class="row"><input :type="f.kind === 'int' || f.kind === 'float' ? 'number' : 'text'" :step="f.kind === 'float' ? 'any' : 1" :min="f.lo" :max="f.hi"
+              v-model="form[f.key]" :disabled="reset[f.key]"><span v-if="f.unit" class="muted small">{{ f.unit }}</span></div>
+          </div>
+          <div class="set-act"><label v-if="f.overridden" class="small"><input type="checkbox" v-model="reset[f.key]"> 恢复为 .env 值</label></div>
+        </div>
+      </div>
+      <div class="muted small">API Key 保存在应用数据库中，页面只显示末 4 位，不会回传明文；后台任务线程数（WORKERS）仍需改 .env 后重启。</div>
+    </template></div>`,
+};
+
 // ---------- 外壳：左侧菜单 + 右侧页面 ----------
 const PAGES = { overview: OverviewPage, list: ListPage, new: NewPage, project: ProjectPage, templates: TemplatesPage, prompts: PromptsPage, library: LibraryPage,
-  stats: StatsPage, members: MembersPage, system: SystemPage };
+  stats: StatsPage, members: MembersPage, system: SystemPage, settings: SettingsPage };
 
 const App = {
   setup() {
@@ -839,7 +894,7 @@ const App = {
         { group: "资产", items: [["templates", "#/templates", "风格组合", "◇"], ["prompts", "#/prompts", "写作提示词", "✎"], ["library", "#/library", "素材库", "▦"]] },
         { group: "管理", items: [["stats", "#/stats", "成本看板", "▥"],
           ...(c.auth !== "open" || admin ? [["members", "#/members", admin ? "成员" : "我的账号", "◎"]] : []),
-          ...(admin ? [["system", "#/system", "系统自检", "⚙"]] : [])] },
+          ...(admin ? [["settings", "#/settings", "模型与参数", "☰"], ["system", "#/system", "系统自检", "⚙"]] : [])] },
       ];
     });
     const active = (name) => store.route.name === name || (name === "list" && store.route.name === "project");
